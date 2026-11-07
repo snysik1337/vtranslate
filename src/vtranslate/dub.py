@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from .fetch import ffmpeg
 from .speech import THREADS, Segment, cached_first
 
 VOICES = {
@@ -153,7 +154,7 @@ def shift_pitch(audio: np.ndarray, factor: float) -> np.ndarray:
 def stretch(audio: np.ndarray, tempo: float, rate: int) -> np.ndarray:
     """Change speed without changing pitch."""
     out = subprocess.run(
-        ["ffmpeg", "-nostdin", "-v", "error", "-f", "f32le", "-ar", str(rate), "-ac", "1",
+        [ffmpeg(), "-nostdin", "-v", "error", "-f", "f32le", "-ar", str(rate), "-ac", "1",
          "-i", "pipe:0",
          "-af", f"atempo={tempo:.4f}", "-f", "f32le", "-"],
         input=audio.astype(np.float32).tobytes(), capture_output=True, check=True,
@@ -295,7 +296,7 @@ class Edge:
         if path.stat().st_size == 0:
             return np.zeros(0, dtype=np.float32)
         raw = subprocess.run(
-            ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-f", "f32le", "-ac", "1",
+            [ffmpeg(), "-nostdin", "-v", "error", "-i", str(path), "-f", "f32le", "-ac", "1",
              "-ar", str(self.rate), "-"],
             capture_output=True, check=True, stdin=subprocess.DEVNULL,
         ).stdout
@@ -448,7 +449,7 @@ def render(video: Path, audio: Path, channels: int, track: np.ndarray, rate: int
         "alimiter=limit=0.89:level=disabled[out]"
     )
     subprocess.run(
-        ["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(video), "-i", str(audio),
+        [ffmpeg(), "-nostdin", "-y", "-v", "error", "-i", str(video), "-i", str(audio),
          "-i", str(dub_path), "-i", str(envelope_path), "-filter_complex", graph,
          "-map", "0:V:0", "-map", "[out]",
          "-c:v", "copy", "-c:a", "aac", "-aac_coder", "fast", "-b:a", "128k",

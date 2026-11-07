@@ -11,7 +11,7 @@ computer.
 
 ## Install
 
-Linux only. Needs ffmpeg. Then:
+Linux only. Nothing else to install first: vtranslate brings its own ffmpeg. Then:
 
 ```bash
 ./install.sh
@@ -83,7 +83,7 @@ it continues from the last finished step.
 | Speaker detection | one sherpa-onnx CAM++ voiceprint per sentence | local |
 | Translation | DeepL, with the surrounding lines and the title as context | online |
 | Voices | Piper (`--best` tries Microsoft's voices first) | local |
-| Mix | ffmpeg | local |
+| Mix | ffmpeg (bundled with vtranslate) | local |
 
 Lines separated by short pauses are spoken as one phrase at one steady speed,
 the slowest that keeps every line within half a second of the original. When

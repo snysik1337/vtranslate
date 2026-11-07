@@ -3,8 +3,6 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-command -v ffmpeg >/dev/null || { echo "Please install ffmpeg first."; exit 1; }
-
 if command -v uv >/dev/null; then
   uv=uv
 else

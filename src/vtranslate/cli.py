@@ -308,9 +308,6 @@ def prepare_translation(args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
     prepare_translation(args)
-    for tool in ("ffmpeg", "ffprobe"):
-        if not shutil.which(tool):
-            raise SystemExit(f"error: {tool} is not installed")
     failed = 0
     for source in args.sources:
         began = time.time()

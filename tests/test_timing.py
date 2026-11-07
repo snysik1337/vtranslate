@@ -265,17 +265,19 @@ def test_mix_keeps_the_original_level_where_nobody_speaks(tmp_path, channels):
 
     import soundfile as sf
 
+    from vtranslate.fetch import ffmpeg
+
     source = tmp_path / "source.wav"
     tone(source, channels)
     video = tmp_path / "video.mp4"
-    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i",
+    subprocess.run([ffmpeg(), "-nostdin", "-v", "error", "-f", "lavfi", "-i",
                     "color=size=64x64:duration=2", "-c:v", "libx264", str(video)], check=True)
     out = tmp_path / "out.mp4"
     envelope = np.ones(300, dtype=np.float32)  # no ducking at all
     dub.render(video, source, channels, np.zeros(44100, dtype=np.float32), 22050,
                envelope, tmp_path, out)
     decoded = tmp_path / "out.wav"
-    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(out), str(decoded)], check=True)
+    subprocess.run([ffmpeg(), "-nostdin", "-v", "error", "-i", str(out), str(decoded)], check=True)
     mixed = sf.read(decoded)[0][4800:-4800]
     rms = lambda x: float(np.sqrt(np.mean(np.square(x))))
     assert rms(mixed) == pytest.approx(0.5 / np.sqrt(2), rel=0.05)  # same as the source
@@ -348,16 +350,26 @@ def test_resuming_at_another_quality_uses_a_different_job_folder():
     assert job_id(url, 720) == job_id(url, 720)
 
 
-def test_probe_ignores_extra_fields(monkeypatch):
+def test_files_are_inspected_without_ffprobe(tmp_path):
     import subprocess
 
     from vtranslate import fetch
 
-    def fake_run(command, **kwargs):
-        return subprocess.CompletedProcess(command, 0, stdout="h264,\n\n", stderr="")
-
-    monkeypatch.setattr(fetch.subprocess, "run", fake_run)
-    assert fetch.video_codec(Path("rotated.mp4")) == "h264"
+    run = lambda *args: subprocess.run([fetch.ffmpeg(), "-nostdin", "-v", "error", "-y", *args],
+                                       check=True)
+    video = tmp_path / "video.mp4"
+    run("-f", "lavfi", "-i", "color=size=64x64:duration=1", "-f", "lavfi", "-i",
+        "sine=duration=1", "-ac", "2", "-c:v", "libx264", "-c:a", "aac", str(video))
+    assert fetch.video_codec(video) == "h264" and fetch.has_audio(video)
+    assert fetch.audio_channels(video) == 2
+    cover = tmp_path / "cover.png"
+    run("-f", "lavfi", "-i", "color=size=64x64:duration=0.1", "-frames:v", "1", str(cover))
+    song = tmp_path / "song.mp3"
+    run("-f", "lavfi", "-i", "sine=duration=1", "-i", str(cover), "-map", "0", "-map", "1",
+        "-c:v", "mjpeg", "-disposition:v", "attached_pic", str(song))
+    assert fetch.has_audio(song) and not fetch.has_video(song)  # cover art is not a video
+    with pytest.raises(fetch.SourceError):
+        fetch.has_audio(tmp_path / "missing.mp4")
 
 
 def test_one_bad_source_does_not_stop_the_batch(monkeypatch, capsys):

@@ -5,6 +5,7 @@ the picture keeps downloading in the background, so work can start straight away
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import re
 import shutil
@@ -127,6 +128,7 @@ def download(url: str, work: Path, quality: int, cookies_from: str | None) -> So
         "no_warnings": True,
         "noprogress": True,
         "concurrent_fragment_downloads": 4,
+        "ffmpeg_location": ffmpeg(),
     }
     deno = _deno_path()
     if deno:
@@ -175,21 +177,37 @@ def local(path: str) -> Source:
     return Source(media, media.stem, video=media)
 
 
-def _probe(media: Path, *arguments: str) -> str:
-    """The first value ffprobe prints, or "". Extra fields, such as the side data
-    of rotated phone videos, are ignored."""
-    out = subprocess.run(["ffprobe", "-v", "error", *arguments, "-of", "csv=p=0", str(media)],
-                         capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL)
-    return re.split(r"[\s,]+", out.stdout.strip())[0]
+@functools.cache
+def ffmpeg() -> str:
+    """The ffmpeg that ships with vtranslate, so nobody has to install one."""
+    import imageio_ffmpeg
+
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def _streams(media: Path):
+    """The audio and video streams of a file, read with PyAV instead of ffprobe."""
+    import av
+
+    try:
+        with av.open(str(media)) as container:
+            audio = list(container.streams.audio)
+            # Cover art and thumbnails are stored as video but are not a video to dub.
+            video = [s for s in container.streams.video
+                     if not s.disposition & av.stream.Disposition.attached_pic]
+            return ([s.codec_context.channels for s in audio],
+                    [s.codec_context.name for s in video])
+    except av.error.FFmpegError as error:
+        raise SourceError(f"cannot read this file ({error})") from error
 
 
 def has_audio(media: Path) -> bool:
-    return bool(_probe(media, "-select_streams", "a", "-show_entries", "stream=index"))
+    return bool(_streams(media)[0])
 
 
 def video_codec(media: Path) -> str:
-    # "V" skips cover art and thumbnails, which are not a video to dub.
-    return _probe(media, "-select_streams", "V:0", "-show_entries", "stream=codec_name")
+    codecs = _streams(media)[1]
+    return codecs[0] if codecs else ""
 
 
 def has_video(media: Path) -> bool:
@@ -197,8 +215,8 @@ def has_video(media: Path) -> bool:
 
 
 def audio_channels(media: Path) -> int:
-    value = _probe(media, "-select_streams", "a:0", "-show_entries", "stream=channels")
-    return int(value) if value.isdigit() else 2
+    channels = _streams(media)[0]
+    return channels[0] if channels and channels[0] else 2
 
 
 def extract_speech_audio(media: Path, dest: Path) -> None:
@@ -209,7 +227,7 @@ def extract_speech_audio(media: Path, dest: Path) -> None:
     """
     tmp = dest.with_name(dest.name + ".part")
     subprocess.run(
-        ["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(media), "-map", "0:a:0",
+        [ffmpeg(), "-nostdin", "-y", "-v", "error", "-i", str(media), "-map", "0:a:0",
          "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-f", "wav", str(tmp)],
         check=True, stdin=subprocess.DEVNULL,
     )
