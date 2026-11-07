@@ -11,13 +11,16 @@ computer.
 
 ## Install
 
-Linux only. Nothing else to install first: vtranslate brings its own ffmpeg. Then:
+On Linux, paste this into a terminal. Nothing else needs installing first:
 
 ```bash
-./install.sh
+curl -LsSf https://raw.githubusercontent.com/snysik1337/vtranslate/main/install.sh | sh
 ```
 
-The first run downloads about 400 MB of models into `~/.cache`.
+Then open a new terminal. Run the same command again to update. The first dub
+downloads about 400 MB of speech and voice models.
+
+To uninstall: `uv tool uninstall vtranslate`
 
 ## DeepL key
 
