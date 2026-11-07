@@ -17,7 +17,8 @@ On Linux, paste this into a terminal. Nothing else needs installing first:
 curl -LsSf https://raw.githubusercontent.com/snysik1337/vtranslate/main/install.sh | sh
 ```
 
-Then open a new terminal. Run the same command again to update. The first dub
+Then open a new terminal. It takes about 1 GB of disk space, and running the same
+command again updates it. The first dub
 downloads about 400 MB of speech and voice models.
 
 To uninstall: `uv tool uninstall vtranslate`
