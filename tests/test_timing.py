@@ -292,7 +292,7 @@ def test_mix_keeps_the_original_level_where_nobody_speaks(tmp_path, channels):
     make_media(video, 2.0)
     out = tmp_path / "out.mp4"
     envelope = np.ones(300, dtype=np.float32)  # no ducking at all
-    dub.render(video, source, np.zeros(44100, dtype=np.float32), 22050, envelope, out)
+    media.render(video, source, np.zeros(44100, dtype=np.float32), 22050, envelope, 100, out)
     mixed = np.concatenate(list(media.decode(out, 48000, "stereo")), axis=1)[:, 4800:-4800]
     rms = lambda x: float(np.sqrt(np.mean(np.square(x))))
     assert rms(mixed) == pytest.approx(0.5 / np.sqrt(2), rel=0.05)  # same as the source
@@ -301,11 +301,13 @@ def test_mix_keeps_the_original_level_where_nobody_speaks(tmp_path, channels):
 def test_mix_keeps_speech_running_past_the_end_of_the_video(tmp_path):
     import av
 
+    from vtranslate import media
+
     video = tmp_path / "video.mp4"
     make_media(video, 1.0)
     out = tmp_path / "out.mkv"
     voice = np.full(3 * 22050, 0.1, dtype=np.float32)
-    dub.render(video, video, voice, 22050, np.ones(200, dtype=np.float32), out)
+    media.render(video, video, voice, 22050, np.ones(200, dtype=np.float32), 100, out)
     with av.open(str(out)) as container:
         streams = {s.type: s for s in container.streams}
         assert streams["video"].codec_context.name == "h264"  # copied, not re-encoded

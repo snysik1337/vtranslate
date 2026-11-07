@@ -174,30 +174,26 @@ def local(path: str) -> Source:
     return Source(media, media.stem, video=media)
 
 
-def _streams(media: Path):
-    """The audio and video streams of a file, read with PyAV instead of ffprobe."""
+def _streams(media: Path) -> tuple[bool, str]:
+    """Whether a file has sound, and its video codec ("" for none), read with PyAV."""
     import av
 
     from .media import picture_stream
 
     try:
         with av.open(str(media)) as container:
-            audio = list(container.streams.audio)
-            # Cover art and thumbnails are stored as video but are not a video to dub.
-            video = picture_stream(container)
-            return ([s.codec_context.channels for s in audio],
-                    [video.codec_context.name] if video else [])
+            video = picture_stream(container)  # cover art does not count as video
+            return bool(container.streams.audio), video.codec_context.name if video else ""
     except av.error.FFmpegError as error:
         raise SourceError(f"cannot read this file ({error})") from error
 
 
 def has_audio(media: Path) -> bool:
-    return bool(_streams(media)[0])
+    return _streams(media)[0]
 
 
 def video_codec(media: Path) -> str:
-    codecs = _streams(media)[1]
-    return codecs[0] if codecs else ""
+    return _streams(media)[1]
 
 
 def has_video(media: Path) -> bool:

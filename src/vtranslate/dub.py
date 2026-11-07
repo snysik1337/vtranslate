@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 
 from . import media
+from .media import stretch
 from .speech import THREADS, Segment, cached_first
 
 VOICES = {
@@ -149,9 +150,19 @@ def shift_pitch(audio: np.ndarray, factor: float) -> np.ndarray:
     return np.interp(np.arange(0, len(audio), factor), np.arange(len(audio)), audio).astype(np.float32)
 
 
-def stretch(audio: np.ndarray, tempo: float, rate: int) -> np.ndarray:
-    """Change speed without changing pitch."""
-    return media.stretch(audio, tempo, rate)
+class Counter:
+    """Shows "speaking: 12/53" as lines finish; calling it passes a result through."""
+
+    def __init__(self, total: int) -> None:
+        self.done, self.total = 0, total
+
+    def __call__(self, result=None):
+        self.done += 1
+        print(f"\r  speaking: {self.done}/{self.total}", end="", file=sys.stderr, flush=True)
+        return result
+
+    def finish(self) -> None:
+        print(file=sys.stderr)
 
 
 class Piper:
@@ -213,18 +224,10 @@ class Piper:
 
     def speak_many(self, lines: list[Line]) -> list[np.ndarray]:
         self.prepare(line.voice for line in lines)
-        done = 0
-
-        def run(line: Line) -> np.ndarray:
-            nonlocal done
-            audio = self._speak(line)
-            done += 1
-            print(f"\r  speaking: {done}/{len(lines)}", end="", file=sys.stderr, flush=True)
-            return audio
-
+        count = Counter(len(lines))
         with ThreadPoolExecutor(THREADS) as pool:
-            result = list(pool.map(run, lines))
-        print(file=sys.stderr)
+            result = list(pool.map(lambda line: count(self._speak(line)), lines))
+        count.finish()
         return result
 
 
@@ -272,16 +275,13 @@ class Edge:
 
     async def _speak_all(self, lines: list[Line]) -> None:
         gate = asyncio.Semaphore(CONCURRENCY)
-        done = 0
+        count = Counter(len(lines))
 
         async def run(line: Line) -> None:
-            nonlocal done
-            await self._speak(line, gate)
-            done += 1
-            print(f"\r  speaking: {done}/{len(lines)}", end="", file=sys.stderr, flush=True)
+            count(await self._speak(line, gate))
 
         await asyncio.gather(*(run(line) for line in lines))
-        print(file=sys.stderr)
+        count.finish()
 
     def _decode(self, line: Line) -> np.ndarray:
         path = self._path(line)
@@ -416,7 +416,3 @@ def match_loudness(track: np.ndarray, original: np.ndarray) -> np.ndarray:
     # Peaks above 1.0 are fine here: the final mix goes through a limiter.
     return track * np.clip(level(original) / dub_level, 0.5, 4.0)
 
-
-def render(video: Path, audio: Path, track: np.ndarray, rate: int, envelope: np.ndarray,
-           output: Path) -> None:
-    media.render(video, audio, track, rate, envelope, ENVELOPE_RATE, output)

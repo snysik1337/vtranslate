@@ -141,10 +141,3 @@ def translate(texts: list[str], language: str, title: str = "") -> list[str]:
         raise _friendly(error) from error
     return results
 
-
-def usage_note() -> str:
-    try:
-        used, limit = check_ready()
-    except TranslationError:
-        return ""
-    return f"DeepL: {used:,} of {limit:,} characters used this month" if limit else ""

@@ -136,9 +136,7 @@ def _dub(source: str, args: argparse.Namespace, work: Path) -> Path:
     key = _text_key(segments, language, got.title)
     russian = cached(work / f"translated-{key}.json",
                      lambda: deepl.translate([s.text for s in segments], language, got.title))
-    note = deepl.usage_note()
-    if note:
-        print(f"  {note}")
+    print_usage("  ")
     for seg, text in zip(segments, russian):
         seg.text = text
 
@@ -173,7 +171,7 @@ def _dub(source: str, args: argparse.Namespace, work: Path) -> Path:
     output = args.output / f"{safe_name(got.title)} [ru]{extension}"
     tmp = output.with_name(f".{output.stem}.tmp{extension}")
     try:
-        dub.render(picture, got.audio, track, engine.rate, envelope, tmp)
+        media.render(picture, got.audio, track, engine.rate, envelope, dub.ENVELOPE_RATE, tmp)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
@@ -231,7 +229,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="maximum download height, e.g. 720 or 2160 (default: %(default)s)")
     parser.add_argument("--best", action="store_true",
                         help="use Microsoft's online voices when they work (nicer, slower)")
-    parser.add_argument("-m", "--model",
+    parser.add_argument("-m", "--model", default="base",
                         choices=["tiny", "base", "small", "medium", "large-v3-turbo", "large-v3"],
                         help="Whisper speech model (default: base, the fastest accurate one; "
                              "small and large-v3-turbo are 3-7x slower but hear accents "
@@ -273,8 +271,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.max_speed < 1:
         parser.error("--max-speed must be at least 1")
 
-    # base is the fast default; small and large-v3-turbo hear accents and noise better
-    args.model = args.model or "base"
     args.tts = args.tts or ("auto" if args.best else "piper")
     return args
 
@@ -292,13 +288,20 @@ def prepare_translation(args: argparse.Namespace) -> None:
         if not args.sources:
             raise SystemExit(0)
     try:
-        used, limit = deepl.check_ready()
+        print_usage()
         if args.source_language:
             deepl.check_language(args.source_language)
     except deepl.TranslationError as error:
         raise SystemExit(f"error: {error}") from error
+
+
+def print_usage(indent: str = "") -> None:
+    """How much of the monthly DeepL allowance is used; raises if none is left."""
+    from . import translate as deepl
+
+    used, limit = deepl.check_ready()
     if limit:
-        print(f"DeepL: {used:,} of {limit:,} characters used this month")
+        print(f"{indent}DeepL: {used:,} of {limit:,} characters used this month")
 
 
 def main() -> None:

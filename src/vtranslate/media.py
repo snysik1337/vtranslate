@@ -9,8 +9,9 @@ from __future__ import annotations
 import wave
 from fractions import Fraction
 from pathlib import Path
-from typing import Iterable, Iterator
+from collections.abc import Iterable, Iterator
 
+import av
 import numpy as np
 
 MIX_RATE = 48000
@@ -22,8 +23,6 @@ class MediaError(RuntimeError):
 
 def picture_stream(container):
     """The video stream to dub. Cover art is stored as video but is not one."""
-    import av
-
     for stream in container.streams.video:
         if not stream.disposition & av.stream.Disposition.attached_pic:
             return stream
@@ -32,8 +31,6 @@ def picture_stream(container):
 
 def _frames(container, stream):
     """Decoded frames, skipping damaged packets the way the ffmpeg command does."""
-    import av
-
     for packet in container.demux(stream):
         try:
             yield from packet.decode()
@@ -43,8 +40,6 @@ def _frames(container, stream):
 
 def decode(path: Path, rate: int, layout: str) -> Iterator[np.ndarray]:
     """The first audio track as float32 blocks shaped (channels, samples)."""
-    import av
-
     try:
         with av.open(str(path)) as container:
             stream = container.streams.audio[0]
@@ -59,8 +54,6 @@ def decode(path: Path, rate: int, layout: str) -> Iterator[np.ndarray]:
 
 
 def channels(path: Path) -> int:
-    import av
-
     with av.open(str(path)) as container:
         return container.streams.audio[0].codec_context.channels or 2
 
@@ -86,8 +79,6 @@ def read_wav(path: Path) -> np.ndarray:
 
 
 def _frame(block: np.ndarray, rate: int, layout: str, pts: int):
-    import av
-
     frame = av.AudioFrame.from_ndarray(np.ascontiguousarray(block, dtype=np.float32),
                                        format="fltp", layout=layout)
     frame.sample_rate = rate
@@ -98,8 +89,6 @@ def _frame(block: np.ndarray, rate: int, layout: str, pts: int):
 
 def filtered(blocks: Iterable[np.ndarray], rate: int, layout: str, name: str, options: str):
     """Run blocks of sound through one FFmpeg filter, yielding the frames it gives back."""
-    import av
-
     graph = av.filter.Graph()
     source = graph.add_abuffer(format="fltp", sample_rate=rate, layout=layout,
                                time_base=Fraction(1, rate))
@@ -135,8 +124,6 @@ def stretch(audio: np.ndarray, tempo: float, rate: int) -> np.ndarray:
 
 def resampled(audio: np.ndarray, rate: int, to: int) -> Iterator[np.ndarray]:
     """Mono audio at another sample rate, a second at a time."""
-    import av
-
     resampler = av.AudioResampler(format="fltp", layout="mono", rate=to)
     for start in range(0, len(audio), rate):
         for out in resampler.resample(_frame(audio[None, start:start + rate], rate, "mono", start)):
@@ -205,8 +192,6 @@ def mix(original: Path, voice: np.ndarray, rate: int, envelope: np.ndarray,
 def render(video: Path, audio: Path, voice: np.ndarray, rate: int, envelope: np.ndarray,
            envelope_rate: int, output: Path) -> None:
     """Copy the picture unchanged and add the mixed sound as AAC."""
-    import av
-
     sound_frames = filtered(mix(audio, voice, rate, envelope, envelope_rate), MIX_RATE,
                             "stereo", "alimiter", "limit=0.89:level=disabled")
     options = {"movflags": "+faststart"} if output.suffix == ".mp4" else {}
