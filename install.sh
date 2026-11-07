@@ -25,7 +25,7 @@ if ! command -v uv >/dev/null 2>&1; then
   fi
 fi
 
-echo "Installing vtranslate (about 1 GB of disk space)..."
+echo "Installing vtranslate (about 750 MB of disk space)..."
 uv tool install --quiet --python 3.12 --force --reinstall-package vtranslate "$source"
 uv tool update-shell >/dev/null 2>&1 || true
 

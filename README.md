@@ -17,9 +17,9 @@ On Linux, paste this into a terminal. Nothing else needs installing first:
 curl -LsSf https://raw.githubusercontent.com/snysik1337/vtranslate/main/install.sh | sh
 ```
 
-Then open a new terminal. It takes about 1 GB of disk space, and running the same
-command again updates it. The first dub downloads about 400 MB of speech and
-voice models.
+Then open a new terminal. It takes about 750 MB of disk space, and running the
+same command again updates it. The first dub downloads the speech models (about
+170 MB) and about 60 MB for each Russian voice it uses, only once.
 
 To uninstall: `uv tool uninstall vtranslate`
 
@@ -87,7 +87,7 @@ it continues from the last finished step.
 | Speaker detection | one sherpa-onnx CAM++ voiceprint per sentence | local |
 | Translation | DeepL, with the surrounding lines and the title as context | online |
 | Voices | Piper (`--best` tries Microsoft's voices first) | local |
-| Mix | ffmpeg (bundled with vtranslate) | local |
+| Mix | PyAV, which contains FFmpeg's libraries, so no ffmpeg program is needed | local |
 
 Lines separated by short pauses are spoken as one phrase at one steady speed,
 the slowest that keeps every line within half a second of the original. When

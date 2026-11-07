@@ -5,11 +5,9 @@ the picture keeps downloading in the background, so work can start straight away
 """
 from __future__ import annotations
 
-import functools
 import hashlib
 import re
 import shutil
-import subprocess
 import sys
 import threading
 from dataclasses import dataclass
@@ -128,7 +126,6 @@ def download(url: str, work: Path, quality: int, cookies_from: str | None) -> So
         "no_warnings": True,
         "noprogress": True,
         "concurrent_fragment_downloads": 4,
-        "ffmpeg_location": ffmpeg(),
     }
     deno = _deno_path()
     if deno:
@@ -177,26 +174,19 @@ def local(path: str) -> Source:
     return Source(media, media.stem, video=media)
 
 
-@functools.cache
-def ffmpeg() -> str:
-    """The ffmpeg that ships with vtranslate, so nobody has to install one."""
-    import imageio_ffmpeg
-
-    return imageio_ffmpeg.get_ffmpeg_exe()
-
-
 def _streams(media: Path):
     """The audio and video streams of a file, read with PyAV instead of ffprobe."""
     import av
+
+    from .media import picture_stream
 
     try:
         with av.open(str(media)) as container:
             audio = list(container.streams.audio)
             # Cover art and thumbnails are stored as video but are not a video to dub.
-            video = [s for s in container.streams.video
-                     if not s.disposition & av.stream.Disposition.attached_pic]
+            video = picture_stream(container)
             return ([s.codec_context.channels for s in audio],
-                    [s.codec_context.name for s in video])
+                    [video.codec_context.name] if video else [])
     except av.error.FFmpegError as error:
         raise SourceError(f"cannot read this file ({error})") from error
 
@@ -214,21 +204,14 @@ def has_video(media: Path) -> bool:
     return bool(video_codec(media))
 
 
-def audio_channels(media: Path) -> int:
-    channels = _streams(media)[0]
-    return channels[0] if channels and channels[0] else 2
-
-
 def extract_speech_audio(media: Path, dest: Path) -> None:
     """Decode the first audio track, the one the final mix uses, to 16 kHz mono.
 
     It is written under a temporary name first, so an interrupted run never
     leaves a shortened file that a rerun would take as complete.
     """
+    from .media import read_mono, write_wav
+
     tmp = dest.with_name(dest.name + ".part")
-    subprocess.run(
-        [ffmpeg(), "-nostdin", "-y", "-v", "error", "-i", str(media), "-map", "0:a:0",
-         "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-f", "wav", str(tmp)],
-        check=True, stdin=subprocess.DEVNULL,
-    )
+    write_wav(tmp, read_mono(media, 16000), 16000)
     tmp.replace(dest)

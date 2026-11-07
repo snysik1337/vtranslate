@@ -251,36 +251,89 @@ def test_short_pauses_stay_ducked_even_when_speech_starts_at_zero():
     assert quiet[0] == pytest.approx(1.0)  # the start of the video is not faded in
 
 
-def tone(path, channels, seconds=2.0, rate=48000, amplitude=0.5):
-    import soundfile as sf
+def make_media(path, seconds=1.0, channels=2, video=True, sound="aac", amplitude=0.5,
+               cover=False):
+    """A small test file, written with PyAV: a 440 Hz tone, with a black picture if asked."""
+    import av
 
-    t = np.arange(int(seconds * rate)) / rate
-    wave = (amplitude * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
-    sf.write(path, np.repeat(wave[:, None], channels, axis=1), rate, subtype="FLOAT")
+    rate, layout = 48000, "mono" if channels == 1 else "stereo"
+    with av.open(str(path), "w") as out:
+        audio = out.add_stream(sound, rate=rate, layout=layout)
+        picture = None
+        if video or cover:
+            picture = out.add_stream("mjpeg" if cover else "libx264", rate=25)
+            picture.width = picture.height = 64
+            picture.pix_fmt = "yuvj420p" if cover else "yuv420p"
+            if cover:
+                picture.disposition = av.stream.Disposition.attached_pic
+        if picture:
+            black = av.VideoFrame.from_ndarray(np.zeros((64, 64, 3), np.uint8), format="rgb24")
+            for i in range(1 if cover else int(seconds * 25)):
+                frame = black.reformat(format=picture.pix_fmt)
+                frame.pts = i
+                out.mux(picture.encode(frame))
+            out.mux(picture.encode(None))
+        t = np.arange(int(seconds * rate)) / rate
+        wave = (amplitude * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+        frame = av.AudioFrame.from_ndarray(np.repeat(wave[None], channels, axis=0),
+                                           format="fltp", layout=layout)
+        frame.sample_rate, frame.pts = rate, 0
+        out.mux(audio.encode(frame))
+        out.mux(audio.encode(None))
 
 
 @pytest.mark.parametrize("channels", [1, 2])
 def test_mix_keeps_the_original_level_where_nobody_speaks(tmp_path, channels):
-    import subprocess
-
-    import soundfile as sf
-
-    from vtranslate.fetch import ffmpeg
+    from vtranslate import media
 
     source = tmp_path / "source.wav"
-    tone(source, channels)
+    make_media(source, 2.0, channels, video=False, sound="pcm_f32le")
     video = tmp_path / "video.mp4"
-    subprocess.run([ffmpeg(), "-nostdin", "-v", "error", "-f", "lavfi", "-i",
-                    "color=size=64x64:duration=2", "-c:v", "libx264", str(video)], check=True)
+    make_media(video, 2.0)
     out = tmp_path / "out.mp4"
     envelope = np.ones(300, dtype=np.float32)  # no ducking at all
-    dub.render(video, source, channels, np.zeros(44100, dtype=np.float32), 22050,
-               envelope, tmp_path, out)
-    decoded = tmp_path / "out.wav"
-    subprocess.run([ffmpeg(), "-nostdin", "-v", "error", "-i", str(out), str(decoded)], check=True)
-    mixed = sf.read(decoded)[0][4800:-4800]
+    dub.render(video, source, np.zeros(44100, dtype=np.float32), 22050, envelope, out)
+    mixed = np.concatenate(list(media.decode(out, 48000, "stereo")), axis=1)[:, 4800:-4800]
     rms = lambda x: float(np.sqrt(np.mean(np.square(x))))
     assert rms(mixed) == pytest.approx(0.5 / np.sqrt(2), rel=0.05)  # same as the source
+
+
+def test_mix_keeps_speech_running_past_the_end_of_the_video(tmp_path):
+    import av
+
+    video = tmp_path / "video.mp4"
+    make_media(video, 1.0)
+    out = tmp_path / "out.mkv"
+    voice = np.full(3 * 22050, 0.1, dtype=np.float32)
+    dub.render(video, video, voice, 22050, np.ones(200, dtype=np.float32), out)
+    with av.open(str(out)) as container:
+        streams = {s.type: s for s in container.streams}
+        assert streams["video"].codec_context.name == "h264"  # copied, not re-encoded
+        assert streams["audio"].metadata.get("language") == "rus"
+        assert container.duration / av.time_base == pytest.approx(3.0, abs=0.1)
+
+
+def test_speech_audio_is_mono_at_16khz(tmp_path):
+    from vtranslate import fetch, media
+
+    video = tmp_path / "video.mp4"
+    make_media(video, 1.0, channels=2, amplitude=0.25)
+    fetch.extract_speech_audio(video, tmp_path / "speech.wav")
+    samples = media.read_wav(tmp_path / "speech.wav")
+    assert len(samples) == pytest.approx(16000, abs=1100)  # the encoder pads a little
+    # FFmpeg's downmix: (left + right) / sqrt(2), so two 0.25 sides give 0.25 * sqrt(2)
+    level = float(np.sqrt(np.mean(samples[1600:-1600] ** 2)))
+    assert level == pytest.approx(0.25, rel=0.1)
+
+
+def test_stretch_changes_length_but_not_pitch():
+    rate = 22050
+    t = np.arange(rate) / rate
+    sound = np.sin(2 * np.pi * 300 * t).astype(np.float32)
+    faster = dub.stretch(sound, 1.25, rate)
+    assert len(faster) == pytest.approx(rate / 1.25, rel=0.03)
+    pitch = np.argmax(np.abs(np.fft.rfft(faster))) * rate / len(faster)
+    assert pitch == pytest.approx(300, abs=5)
 
 
 def test_identical_lines_are_requested_once(tmp_path, monkeypatch):
@@ -351,22 +404,13 @@ def test_resuming_at_another_quality_uses_a_different_job_folder():
 
 
 def test_files_are_inspected_without_ffprobe(tmp_path):
-    import subprocess
-
     from vtranslate import fetch
 
-    run = lambda *args: subprocess.run([fetch.ffmpeg(), "-nostdin", "-v", "error", "-y", *args],
-                                       check=True)
     video = tmp_path / "video.mp4"
-    run("-f", "lavfi", "-i", "color=size=64x64:duration=1", "-f", "lavfi", "-i",
-        "sine=duration=1", "-ac", "2", "-c:v", "libx264", "-c:a", "aac", str(video))
+    make_media(video)
     assert fetch.video_codec(video) == "h264" and fetch.has_audio(video)
-    assert fetch.audio_channels(video) == 2
-    cover = tmp_path / "cover.png"
-    run("-f", "lavfi", "-i", "color=size=64x64:duration=0.1", "-frames:v", "1", str(cover))
     song = tmp_path / "song.mp3"
-    run("-f", "lavfi", "-i", "sine=duration=1", "-i", str(cover), "-map", "0", "-map", "1",
-        "-c:v", "mjpeg", "-disposition:v", "attached_pic", str(song))
+    make_media(song, channels=1, video=False, sound="libmp3lame", cover=True)
     assert fetch.has_audio(song) and not fetch.has_video(song)  # cover art is not a video
     with pytest.raises(fetch.SourceError):
         fetch.has_audio(tmp_path / "missing.mp4")

@@ -5,7 +5,6 @@ import argparse
 import json
 import re
 import shutil
-import subprocess
 import sys
 import time
 from dataclasses import asdict
@@ -76,9 +75,7 @@ def run(source: str, args: argparse.Namespace) -> Path:
 
 
 def _dub(source: str, args: argparse.Namespace, work: Path) -> Path:
-    import soundfile as sf
-
-    from . import dub, fetch, speech
+    from . import dub, fetch, media, speech
     from .fetch import SourceError
     from . import translate as deepl
 
@@ -94,7 +91,7 @@ def _dub(source: str, args: argparse.Namespace, work: Path) -> Path:
     speech_wav = work / "speech.wav"
     if not speech_wav.exists():
         fetch.extract_speech_audio(got.audio, speech_wav)
-    samples = sf.read(speech_wav, dtype="float32")[0]
+    samples = media.read_wav(speech_wav)
     total = len(samples) / speech.RATE
     print(f"  {got.title} ({total / 60:.1f} min)")
 
@@ -176,8 +173,7 @@ def _dub(source: str, args: argparse.Namespace, work: Path) -> Path:
     output = args.output / f"{safe_name(got.title)} [ru]{extension}"
     tmp = output.with_name(f".{output.stem}.tmp{extension}")
     try:
-        dub.render(picture, got.audio, fetch.audio_channels(got.audio), track, engine.rate,
-                   envelope, work, tmp)
+        dub.render(picture, got.audio, track, engine.rate, envelope, tmp)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
@@ -313,7 +309,7 @@ def main() -> None:
         began = time.time()
         try:
             output = run(source, args)
-        except (RuntimeError, OSError, subprocess.CalledProcessError) as error:
+        except (RuntimeError, OSError) as error:
             # One bad source must not stop the rest of the batch.
             failed += 1
             print(f"error: {source}: {error}", file=sys.stderr)

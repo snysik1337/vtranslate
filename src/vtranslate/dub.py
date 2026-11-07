@@ -5,16 +5,14 @@ import asyncio
 import hashlib
 import json
 import re
-import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import soundfile as sf
 
-from .fetch import ffmpeg
+from . import media
 from .speech import THREADS, Segment, cached_first
 
 VOICES = {
@@ -153,13 +151,7 @@ def shift_pitch(audio: np.ndarray, factor: float) -> np.ndarray:
 
 def stretch(audio: np.ndarray, tempo: float, rate: int) -> np.ndarray:
     """Change speed without changing pitch."""
-    out = subprocess.run(
-        [ffmpeg(), "-nostdin", "-v", "error", "-f", "f32le", "-ar", str(rate), "-ac", "1",
-         "-i", "pipe:0",
-         "-af", f"atempo={tempo:.4f}", "-f", "f32le", "-"],
-        input=audio.astype(np.float32).tobytes(), capture_output=True, check=True,
-    )
-    return np.frombuffer(out.stdout, dtype=np.float32)
+    return media.stretch(audio, tempo, rate)
 
 
 class Piper:
@@ -295,12 +287,7 @@ class Edge:
         path = self._path(line)
         if path.stat().st_size == 0:
             return np.zeros(0, dtype=np.float32)
-        raw = subprocess.run(
-            [ffmpeg(), "-nostdin", "-v", "error", "-i", str(path), "-f", "f32le", "-ac", "1",
-             "-ar", str(self.rate), "-"],
-            capture_output=True, check=True, stdin=subprocess.DEVNULL,
-        ).stdout
-        return trim(np.frombuffer(raw, dtype=np.float32), self.rate)
+        return trim(media.read_mono(path, self.rate), self.rate)
 
     def speak_many(self, lines: list[Line]) -> list[np.ndarray]:
         # Identical lines share one file, so each is requested once. Requesting
@@ -430,29 +417,6 @@ def match_loudness(track: np.ndarray, original: np.ndarray) -> np.ndarray:
     return track * np.clip(level(original) / dub_level, 0.5, 4.0)
 
 
-def render(video: Path, audio: Path, channels: int, track: np.ndarray, rate: int,
-           envelope: np.ndarray, work: Path, output: Path) -> None:
-    dub_path, envelope_path = work / "dub.wav", work / "envelope.wav"
-    sf.write(dub_path, track, rate, subtype="FLOAT")
-    sf.write(envelope_path, envelope, ENVELOPE_RATE, subtype="FLOAT")
-    # ffmpeg's own mono-to-stereo conversion lowers the level by 3 dB, which
-    # would turn every gain down. Copying the one channel to both sides keeps it.
-    both_sides = "pan=stereo|c0=c0|c1=c0"
-    original = both_sides if channels == 1 else "aformat=channel_layouts=stereo"
-    graph = (
-        f"[1:a:0]aresample=48000,{original},aformat=sample_fmts=fltp[original];"
-        f"[3:a]aresample=48000,{both_sides},aformat=sample_fmts=fltp[gain];"
-        "[original][gain]amultiply[quiet];"
-        f"[2:a]aresample=48000,{both_sides},aformat=sample_fmts=fltp[voice];"
-        # duration=longest: a line still being spoken as the video ends is kept
-        "[quiet][voice]amix=inputs=2:duration=longest:normalize=0,"
-        "alimiter=limit=0.89:level=disabled[out]"
-    )
-    subprocess.run(
-        [ffmpeg(), "-nostdin", "-y", "-v", "error", "-i", str(video), "-i", str(audio),
-         "-i", str(dub_path), "-i", str(envelope_path), "-filter_complex", graph,
-         "-map", "0:V:0", "-map", "[out]",
-         "-c:v", "copy", "-c:a", "aac", "-aac_coder", "fast", "-b:a", "128k",
-         "-metadata:s:a:0", "language=rus", "-movflags", "+faststart", str(output)],
-        check=True, stdin=subprocess.DEVNULL,
-    )
+def render(video: Path, audio: Path, track: np.ndarray, rate: int, envelope: np.ndarray,
+           output: Path) -> None:
+    media.render(video, audio, track, rate, envelope, ENVELOPE_RATE, output)

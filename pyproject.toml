@@ -1,6 +1,6 @@
 [project]
 name = "vtranslate"
-version = "0.6.0"
+version = "0.7.0"
 description = "Download a video and dub it into Russian with one voice per speaker, translated by DeepL"
 requires-python = ">=3.11,<3.14"
 dependencies = [
@@ -12,11 +12,9 @@ dependencies = [
   "deno",
   "huggingface_hub",
   "deepl>=1.20",
-  "imageio-ffmpeg>=0.6",
-  "av",
+  "av>=14",
   "onnxruntime",
   "numpy",
-  "soundfile",
 ]
 
 [project.scripts]
