@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+samples/
+*.mp4
+*.mkv
+*.wav
+deepl-key
+.env
