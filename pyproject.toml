@@ -1,8 +1,8 @@
 [project]
 name = "vtranslate"
-version = "0.7.0"
+version = "0.7.1"
 description = "Download a video and dub it into Russian with one voice per speaker, translated by DeepL"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.15"
 dependencies = [
   "faster-whisper>=1.1",
   "sherpa-onnx>=1.12",

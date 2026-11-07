@@ -17,8 +17,9 @@ On Linux, paste this into a terminal. Nothing else needs installing first:
 curl -LsSf https://raw.githubusercontent.com/snysik1337/vtranslate/main/install.sh | sh
 ```
 
-Then open a new terminal. It takes about 750 MB of disk space, and running the
-same command again updates it. The first dub downloads the speech models (about
+Then open a new terminal. It takes about 650 MB of disk space (about 110 MB more
+if your Python is not version 3.11 to 3.14, because one is downloaded for it), and
+running the same command again updates it. The first dub downloads the speech models (about
 170 MB) and about 60 MB for each Russian voice it uses, only once.
 
 To uninstall: `uv tool uninstall vtranslate`

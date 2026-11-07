@@ -14,7 +14,7 @@ else
   source="$ARCHIVE"
 fi
 
-# uv installs Python packages and fetches a Python version that suits them.
+# uv installs Python packages, and Python itself if the computer's does not suit.
 if ! command -v uv >/dev/null 2>&1; then
   if [ -x "$HOME/.local/bin/uv" ]; then
     PATH="$HOME/.local/bin:$PATH"
@@ -25,8 +25,11 @@ if ! command -v uv >/dev/null 2>&1; then
   fi
 fi
 
-echo "Installing vtranslate (about 750 MB of disk space)..."
-uv tool install --quiet --python 3.12 --force --reinstall-package vtranslate "$source"
+# The computer's own Python is used when it is a version every part supports;
+# otherwise uv downloads one (about 110 MB more).
+echo "Installing vtranslate (about 650 MB of disk space)..."
+uv tool install --quiet --python-preference system --python ">=3.11,<3.15" \
+  --force --reinstall-package vtranslate "$source"
 uv tool update-shell >/dev/null 2>&1 || true
 
 echo
