@@ -6,15 +6,20 @@ FFmpeg code the ffmpeg command would, inside this process.
 """
 from __future__ import annotations
 
+import functools
 import wave
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
-from collections.abc import Iterable, Iterator
 
 import av
 import numpy as np
 
 MIX_RATE = 48000
+# Tags MP4 players know; Apple only plays HEVC tagged hvc1, so a copied picture
+# keeps its tag when it is one of these, as the ffmpeg command did.
+MP4_TAGS = {"avc1", "avc3", "hvc1", "hev1", "av01", "vp09", "mp4v"}
 
 
 class MediaError(RuntimeError):
@@ -27,6 +32,32 @@ def picture_stream(container):
         if not stream.disposition & av.stream.Disposition.attached_pic:
             return stream
     return None
+
+
+@dataclass(frozen=True)
+class Info:
+    channels: int  # of the first audio track; 0 when there is no sound
+    codec: str  # of the picture; "" when there is none (cover art does not count)
+    tag: str
+
+
+def inspect(path: Path) -> Info:
+    """What a file contains. Each file is opened once, however often it is asked."""
+    try:
+        stat = path.stat()
+        return _inspect(str(path), stat.st_size, stat.st_mtime_ns)
+    except (OSError, av.error.FFmpegError) as error:
+        raise MediaError(f"cannot read this file ({error})") from error
+
+
+@functools.lru_cache(maxsize=32)
+def _inspect(path: str, size: int, mtime: int) -> Info:
+    with av.open(path) as container:
+        audio = container.streams.audio
+        picture = picture_stream(container)
+        return Info(audio[0].codec_context.channels or 2 if audio else 0,
+                    picture.codec_context.name if picture else "",
+                    picture.codec_context.codec_tag if picture else "")
 
 
 def _frames(container, stream):
@@ -42,6 +73,8 @@ def decode(path: Path, rate: int, layout: str) -> Iterator[np.ndarray]:
     """The first audio track as float32 blocks shaped (channels, samples)."""
     try:
         with av.open(str(path)) as container:
+            if not container.streams.audio:
+                raise MediaError(f"{path.name} has no sound")
             stream = container.streams.audio[0]
             resampler = av.AudioResampler(format="fltp", layout=layout, rate=rate)
             for frame in _frames(container, stream):
@@ -53,23 +86,20 @@ def decode(path: Path, rate: int, layout: str) -> Iterator[np.ndarray]:
         raise MediaError(f"cannot read {path.name} ({error})") from error
 
 
-def channels(path: Path) -> int:
-    with av.open(str(path)) as container:
-        return container.streams.audio[0].codec_context.channels or 2
-
-
 def read_mono(path: Path, rate: int) -> np.ndarray:
     blocks = [block[0] for block in decode(path, rate, "mono")]
     return np.concatenate(blocks) if blocks else np.zeros(0, dtype=np.float32)
 
 
-def write_wav(path: Path, samples: np.ndarray, rate: int) -> None:
-    pcm = np.clip(np.round(samples * 32768), -32768, 32767).astype("<i2")
-    with wave.open(str(path), "wb") as out:
+def write_speech(media: Path, dest: Path, rate: int) -> None:
+    """The first audio track as a mono 16-bit WAV, written as it is decoded."""
+    with wave.open(str(dest), "wb") as out:
         out.setnchannels(1)
         out.setsampwidth(2)
         out.setframerate(rate)
-        out.writeframes(pcm.tobytes())
+        for block in decode(media, rate, "mono"):
+            pcm = np.clip(np.round(block[0] * 32768), -32768, 32767).astype("<i2")
+            out.writeframes(pcm.tobytes())
 
 
 def read_wav(path: Path) -> np.ndarray:
@@ -117,8 +147,11 @@ def filtered(blocks: Iterable[np.ndarray], rate: int, layout: str, name: str, op
 
 def stretch(audio: np.ndarray, tempo: float, rate: int) -> np.ndarray:
     """Change speed without changing pitch."""
-    out = [frame.to_ndarray()[0]
-           for frame in filtered([audio[None]], rate, "mono", "atempo", f"{tempo:.4f}")]
+    try:
+        out = [frame.to_ndarray()[0]
+               for frame in filtered([audio[None]], rate, "mono", "atempo", f"{tempo:.4f}")]
+    except av.error.FFmpegError as error:
+        raise MediaError(f"cannot change the speed of a line ({error})") from error
     return np.concatenate(out) if out else np.zeros(0, dtype=np.float32)
 
 
@@ -171,7 +204,7 @@ def mix(original: Path, voice: np.ndarray, rate: int, envelope: np.ndarray,
     It runs as long as the longer of the two, so a line still being spoken as the
     video ends is kept. A mono original is copied to both sides at full level.
     """
-    mono = channels(original) == 1
+    mono = inspect(original).channels == 1
     sides = decode(original, MIX_RATE, "mono" if mono else "stereo")
     if mono:
         sides = (np.repeat(block, 2, axis=0) for block in sides)
@@ -198,7 +231,12 @@ def render(video: Path, audio: Path, voice: np.ndarray, rate: int, envelope: np.
     try:
         with av.open(str(video)) as source, av.open(str(output), "w", options=options) as out:
             picture = picture_stream(source)
+            if picture is None:
+                raise MediaError(f"{video.name} has no video")
             copy = out.add_stream_from_template(picture)
+            tag = picture.codec_context.codec_tag
+            if output.suffix == ".mp4" and tag in MP4_TAGS:
+                copy.codec_context.codec_tag = tag
             sound = out.add_stream("aac", rate=MIX_RATE, layout="stereo",
                                    options={"aac_coder": "fast"})
             sound.bit_rate = 128_000
@@ -220,10 +258,15 @@ def render(video: Path, audio: Path, voice: np.ndarray, rate: int, envelope: np.
 
             # Interleave picture and sound by time, so players read the file evenly.
             for packet in source.demux(picture):
-                if packet.dts is None:
+                if not packet.size:  # the empty packet that ends the stream
                     continue
-                sound_until(float((packet.dts - shift) * picture.time_base) + 0.5)
-                packet.dts -= shift
+                # Some files (Matroska with B-frames) leave out a few decode
+                # times; the muxer works them out, so such packets are kept.
+                stamp = packet.dts if packet.dts is not None else packet.pts
+                if stamp is not None:
+                    sound_until(float((stamp - shift) * picture.time_base) + 0.5)
+                if packet.dts is not None:
+                    packet.dts -= shift
                 if packet.pts is not None:
                     packet.pts -= shift
                 packet.stream = copy

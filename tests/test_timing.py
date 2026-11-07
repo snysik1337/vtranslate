@@ -593,3 +593,53 @@ def test_defaults_are_fast_and_best_switches_everything():
     assert (best.model, best.tts, best.best) == ("base", "auto", True)
     chosen = parse_args(["x", "--best", "-m", "tiny", "--tts", "piper"])
     assert (chosen.model, chosen.tts) == ("tiny", "piper")
+
+
+def test_usage_note_after_translation_never_fails_the_dub(monkeypatch, capsys):
+    from vtranslate import cli
+    from vtranslate import translate as deepl
+
+    def used_up(value=None):
+        raise deepl.TranslationError("this month's DeepL allowance is used up")
+
+    monkeypatch.setattr(deepl, "check_ready", used_up)
+    cli.print_usage("  ", required=False)  # the translation that used it up is saved
+    with pytest.raises(deepl.TranslationError):
+        cli.print_usage()  # before starting, though, it must stop the run
+
+
+def test_matroska_packets_without_decode_times_are_kept(tmp_path):
+    import av
+
+    from vtranslate import media
+
+    video = tmp_path / "video.mkv"  # libx264 uses B-frames, which leave some dts unset
+    make_media(video, 2.0)
+    sound = tmp_path / "sound.wav"
+    make_media(sound, 2.0, video=False, sound="pcm_f32le")
+    out = tmp_path / "out.mp4"
+    media.render(video, sound, np.zeros(100, dtype=np.float32), 22050,
+                 np.ones(300, dtype=np.float32), 100, out)
+    count = lambda path: sum(1 for p in av.open(str(path)).demux(video=0) if p.size)
+    assert count(out) == count(video) == 50
+
+
+def test_media_errors_stay_with_one_source():
+    from vtranslate import media
+
+    with pytest.raises(media.MediaError):  # a RuntimeError, so only this source fails
+        media.stretch(np.ones(22050, dtype=np.float32), 0.0, 22050)
+
+
+def test_each_file_is_opened_once_for_inspection(tmp_path, monkeypatch):
+    import av
+
+    from vtranslate import fetch
+
+    video = tmp_path / "video.mp4"
+    make_media(video)
+    opened = []
+    real = av.open
+    monkeypatch.setattr(av, "open", lambda *a, **k: opened.append(a) or real(*a, **k))
+    assert fetch.has_audio(video) and fetch.has_video(video) and fetch.video_codec(video) == "h264"
+    assert len(opened) == 1

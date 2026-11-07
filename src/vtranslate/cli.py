@@ -136,7 +136,7 @@ def _dub(source: str, args: argparse.Namespace, work: Path) -> Path:
     key = _text_key(segments, language, got.title)
     russian = cached(work / f"translated-{key}.json",
                      lambda: deepl.translate([s.text for s in segments], language, got.title))
-    print_usage("  ")
+    print_usage("  ", required=False)  # only a note: the translation is done and saved
     for seg, text in zip(segments, russian):
         seg.text = text
 
@@ -295,11 +295,20 @@ def prepare_translation(args: argparse.Namespace) -> None:
         raise SystemExit(f"error: {error}") from error
 
 
-def print_usage(indent: str = "") -> None:
-    """How much of the monthly DeepL allowance is used; raises if none is left."""
+def print_usage(indent: str = "", required: bool = True) -> None:
+    """How much of the monthly DeepL allowance is used.
+
+    When required, an unusable DeepL (no allowance left, offline) raises;
+    otherwise the note is just left out.
+    """
     from . import translate as deepl
 
-    used, limit = deepl.check_ready()
+    try:
+        used, limit = deepl.check_ready()
+    except deepl.TranslationError:
+        if required:
+            raise
+        return
     if limit:
         print(f"{indent}DeepL: {used:,} of {limit:,} characters used this month")
 

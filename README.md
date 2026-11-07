@@ -22,6 +22,9 @@ if your Python is not version 3.11 to 3.14, because one is downloaded for it), a
 running the same command again updates it. The first dub downloads the speech models (about
 170 MB) and about 60 MB for each Russian voice it uses, only once.
 
+If your system's Python is upgraded to a new version (3.14 to 3.15, say) and
+`vtranslate` stops starting, run the same command again.
+
 To uninstall: `uv tool uninstall vtranslate`
 
 ## DeepL key
@@ -109,6 +112,8 @@ Each run prints how long every stage took.
   again, but shorter skipped lines stay missing from the dub.
 - Microsoft's free voices are unofficial and can fail. If they do, the whole video
   uses Piper, so voices never change partway through.
+- A few sites stream in a way only the ffmpeg program can download. vtranslate
+  says so when that happens; installing ffmpeg with your package manager fixes it.
 - Only videos are supported: an address or file with sound but no picture is
   refused straight away. For an address holding a list of videos, the first one
   is used.

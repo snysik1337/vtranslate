@@ -19,7 +19,7 @@ if ! command -v uv >/dev/null 2>&1; then
   if [ -x "$HOME/.local/bin/uv" ]; then
     PATH="$HOME/.local/bin:$PATH"
   else
-    echo "Installing uv, which sets up vtranslate's Python for it..."
+    echo "Installing uv, which installs vtranslate and its parts..."
     curl -LsSf https://astral.sh/uv/install.sh | sh
     PATH="$HOME/.local/bin:$PATH"
   fi

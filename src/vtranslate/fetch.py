@@ -140,7 +140,10 @@ def download(url: str, work: Path, quality: int, cookies_from: str | None) -> So
                 info = ydl.extract_info(url, download=True)
         except yt_dlp.utils.YoutubeDLError as error:
             # Often temporary (network, rate limits), so the job folder is kept.
-            raise RuntimeError(re.sub(r"^ERROR:\s*", "", str(error))) from error
+            message = re.sub(r"^ERROR:\s*", "", str(error))
+            if "ffmpeg" in message.lower() and not shutil.which("ffmpeg"):
+                message += " (this site needs ffmpeg: install it with your package manager)"
+            raise RuntimeError(message) from error
         if "entries" in info:
             entries = [e for e in info["entries"] or [] if e]
             if not entries:
@@ -174,26 +177,21 @@ def local(path: str) -> Source:
     return Source(media, media.stem, video=media)
 
 
-def _streams(media: Path) -> tuple[bool, str]:
-    """Whether a file has sound, and its video codec ("" for none), read with PyAV."""
-    import av
-
-    from .media import picture_stream
+def _streams(media: Path):
+    from .media import MediaError, inspect
 
     try:
-        with av.open(str(media)) as container:
-            video = picture_stream(container)  # cover art does not count as video
-            return bool(container.streams.audio), video.codec_context.name if video else ""
-    except av.error.FFmpegError as error:
-        raise SourceError(f"cannot read this file ({error})") from error
+        return inspect(media)
+    except MediaError as error:
+        raise SourceError(str(error)) from error
 
 
 def has_audio(media: Path) -> bool:
-    return _streams(media)[0]
+    return _streams(media).channels > 0
 
 
 def video_codec(media: Path) -> str:
-    return _streams(media)[1]
+    return _streams(media).codec
 
 
 def has_video(media: Path) -> bool:
@@ -206,8 +204,8 @@ def extract_speech_audio(media: Path, dest: Path) -> None:
     It is written under a temporary name first, so an interrupted run never
     leaves a shortened file that a rerun would take as complete.
     """
-    from .media import read_mono, write_wav
+    from .media import write_speech
 
     tmp = dest.with_name(dest.name + ".part")
-    write_wav(tmp, read_mono(media, 16000), 16000)
+    write_speech(media, tmp, 16000)
     tmp.replace(dest)
