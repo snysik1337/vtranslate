@@ -58,23 +58,74 @@ def safe_name(title: str) -> str:
     return name.strip(" .") or "video"
 
 
+class AlreadyDubbed(Exception):
+    """The source was dubbed before with the same settings; carries the file."""
+
+
+def _settings(args: argparse.Namespace) -> dict:
+    """Every option that changes the finished video."""
+    return {name: getattr(args, name) for name in (
+        "model", "voice", "tts", "speakers", "speaker_threshold", "source_language",
+        "original_volume", "max_speed")}
+
+
+def already_dubbed(source: str, args: argparse.Namespace) -> Path | None:
+    """The finished file, if this source was dubbed before with the same settings.
+
+    A finished video leaves a note of where it went and with which settings,
+    so rerunning a batch (after Ctrl+C, say) skips it instead of dubbing and
+    paying for it again. Different settings, or a deleted file, dub it again.
+    It needs no network, so a finished batch reruns even offline.
+    """
+    from . import fetch
+
+    try:
+        work = CACHE / fetch.job_id(source, args.quality)
+        note = json.loads(work.with_suffix(".done").read_text(encoding="utf-8"))
+        output = Path(note["output"])
+        if note["settings"] == _settings(args) and output.exists() and output.parent == args.output:
+            return output
+    except (OSError, ValueError, KeyError, TypeError):
+        pass  # no note, one from an older version, or a file that is gone
+    return None
+
+
 def run(source: str, args: argparse.Namespace) -> Path:
     from . import fetch
 
     if not fetch.is_url(source) and not Path(source).expanduser().is_file():
         raise fetch.SourceError("not a URL or an existing file")
     work = CACHE / fetch.job_id(source, args.quality)
+    finished, settings = work.with_suffix(".done"), _settings(args)
+    done = already_dubbed(source, args)
+    if done:
+        raise AlreadyDubbed(done)
     work.mkdir(parents=True, exist_ok=True)
     try:
         output = _dub(source, args, work)
     except fetch.SourceError:
         shutil.rmtree(work, ignore_errors=True)  # a rerun cannot succeed, so keep nothing
         raise
+    try:  # only a convenience: the video is finished even if this fails
+        tmp = finished.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"output": str(output), "settings": settings}), encoding="utf-8")
+        tmp.replace(finished)
+    except (OSError, ValueError):
+        pass
     shutil.rmtree(work, ignore_errors=True)
     return output
 
 
 def _dub(source: str, args: argparse.Namespace, work: Path) -> Path:
+    sources: list = []
+    try:
+        return _dub_steps(source, args, work, sources)
+    finally:
+        for got in sources:
+            got.cancel()  # a picture still downloading is not needed any more
+
+
+def _dub_steps(source: str, args: argparse.Namespace, work: Path, sources: list) -> Path:
     from . import dub, fetch, media, speech
     from .fetch import SourceError
     from . import translate as deepl
@@ -86,6 +137,7 @@ def _dub(source: str, args: argparse.Namespace, work: Path) -> Path:
         got = fetch.download(source, work, args.quality, args.cookies_from_browser)
     else:
         got = fetch.local(source)
+    sources.append(got)
     if not fetch.has_audio(got.audio):
         raise SourceError("this video has no audio track")
     speech_wav = work / "speech.wav"
@@ -200,7 +252,16 @@ def ask_for_key() -> bool:
     print(f"  1. Sign up for 'DeepL API Free' at {deepl.SIGN_UP}")
     print("  2. Copy the key from your account's API Keys page and paste it below.")
     print("It is saved for your user only, and you won't be asked again.")
-    value = getpass.getpass("DeepL key (Enter to cancel): ").strip()
+    try:
+        value = getpass.getpass("DeepL key (Enter to cancel): ").strip()
+    except EOFError:  # Ctrl+D cancels the prompt; Ctrl+C stops vtranslate in main()
+        print()
+        return False
+    except (OSError, UnicodeError) as error:  # an unusual terminal, or pasted text it can't read
+        print(f"\nCould not read the key from this terminal ({error}).")
+        print(f"Save it with a text editor in {deepl.KEY_FILE} (one line, nothing else),")
+        print("then run vtranslate again.")
+        return False
     if not value:
         return False
     try:
@@ -272,6 +333,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--max-speed must be at least 1")
 
     args.tts = args.tts or ("auto" if args.best else "piper")
+    args.output = args.output.expanduser().resolve()
     return args
 
 
@@ -284,7 +346,9 @@ def prepare_translation(args: argparse.Namespace) -> None:
             raise SystemExit("error: no DeepL key is set up; run vtranslate --set-deepl-key "
                              "in a terminal first")
         if not ask_for_key():
-            raise SystemExit("no key saved; vtranslate needs a DeepL key to translate")
+            if not deepl.key():
+                raise SystemExit("no key saved; vtranslate needs a DeepL key to translate")
+            print("Keeping the key you already have.")
         if not args.sources:
             raise SystemExit(0)
     try:
@@ -314,13 +378,32 @@ def print_usage(indent: str = "", required: bool = True) -> None:
 
 
 def main() -> None:
+    try:
+        _main()
+    except KeyboardInterrupt:
+        # Finished steps and videos are saved, so the same command continues.
+        print("\ncancelled; run the same command again to continue", file=sys.stderr)
+        sys.exit(130)  # the usual status for Ctrl+C
+
+
+def _main() -> None:
     args = parse_args()
-    prepare_translation(args)
+    finished = {source: already_dubbed(source, args) for source in args.sources}
+    for source, output in finished.items():
+        if output:
+            print(f"Already dubbed with these settings (delete it to dub again): {output}")
+    todo = [source for source in args.sources if not finished[source]]
+    if todo or args.set_deepl_key:
+        prepare_translation(args)  # DeepL is only needed for videos still to dub
     failed = 0
-    for source in args.sources:
+    for source in todo:
         began = time.time()
         try:
             output = run(source, args)
+        except AlreadyDubbed as skipped:
+            print(f"Already dubbed with these settings (delete it to dub again): "
+                  f"{skipped.args[0]}")
+            continue
         except (RuntimeError, OSError) as error:
             # One bad source must not stop the rest of the batch.
             failed += 1

@@ -1,15 +1,24 @@
 """Speech recognition, speaker labelling and sentence building."""
 from __future__ import annotations
 
+import bisect
+import glob
+import itertools
 import os
 import re
+import shutil
 import sys
+import tempfile
+import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
 
+REINSTALL = ("curl -LsSf https://raw.githubusercontent.com/snysik1337/vtranslate/main/install.sh"
+             " | sh")
 MODELS = Path.home() / ".cache" / "vtranslate" / "models"
 EMBEDDING_URL = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
@@ -18,6 +27,7 @@ EMBEDDING_URL = (
 THREADS = max(1, (os.cpu_count() or 2) // 2)
 WHISPER_BATCH = 8
 RATE = 16000
+STALE_DOWNLOAD = 3600  # seconds
 
 SENTENCE_END = re.compile(r'[.!?…。！？؟]["»”\')\]]*$')
 CLAUSE_END = re.compile(r"[,;:—–、，；：]$")
@@ -73,6 +83,8 @@ def cached_first(load, *args, **options):
 
 
 def transcribe(samples: np.ndarray, model_name: str, language: str | None) -> tuple[list[Word], str]:
+    # The model hub library suggests an access token on first download; none is needed.
+    os.environ.setdefault("HF_HUB_VERBOSITY", "error")
     from faster_whisper import BatchedInferencePipeline, WhisperModel
 
     model = cached_first(WhisperModel, model_name, device="cpu", compute_type="int8",
@@ -97,9 +109,12 @@ def transcribe(samples: np.ndarray, model_name: str, language: str | None) -> tu
 def find_gaps(speech: list[tuple[float, float]], words: list[Word]) -> list[tuple[float, float]]:
     """Stretches where someone is talking but no words were recognised."""
     gaps = []
-    index = 0
+    reach = list(itertools.accumulate((w.end for w in words), max))  # sorted, for bisect
     for start, end in speech:
         cursor = start
+        # Only words reaching into this span count, so a gap between two spans is
+        # not blamed on the later one. A binary search keeps long videos fast.
+        index = bisect.bisect_right(reach, start)
         while index < len(words) and words[index].start < end:
             word = words[index]
             if word.start - cursor >= MIN_SKIPPED_SPEECH:
@@ -198,11 +213,34 @@ def _embedding_model() -> Path:
     model = MODELS / EMBEDDING_URL.rsplit("/", 1)[1]
     if not model.exists():
         print("  downloading speaker model")
-        MODELS.mkdir(parents=True, exist_ok=True)
-        tmp = model.with_suffix(".part")
-        urllib.request.urlretrieve(EMBEDDING_URL, tmp)
-        tmp.rename(model)
+        download_file(EMBEDDING_URL, model)
     return model
+
+
+def download_file(url: str, dest: Path) -> None:
+    """Fetch url to dest, refusing a short download so a cut-off file is never kept."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # A run that was killed mid-download leaves its partial file behind. One
+    # untouched for an hour belongs to no running download, so it is removed.
+    for stale in dest.parent.glob(f"{glob.escape(dest.name)}.*.part"):
+        try:
+            if time.time() - stale.stat().st_mtime > STALE_DOWNLOAD:
+                stale.unlink()
+        except OSError:
+            pass  # another run removed it first
+    # A name of its own, so two runs fetching the same file never share it.
+    fd, name = tempfile.mkstemp(dir=dest.parent, prefix=dest.name + ".", suffix=".part")
+    os.close(fd)
+    tmp = Path(name)
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response, tmp.open("wb") as out:
+            expected = int(response.headers.get("Content-Length") or 0)
+            shutil.copyfileobj(response, out)
+        if expected and tmp.stat().st_size != expected:
+            raise OSError(f"download of {dest.name} was cut short; run again to retry")
+        tmp.replace(dest)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def label_speakers(samples: np.ndarray, sentences: list[Segment], speakers: int | None,
@@ -212,18 +250,33 @@ def label_speakers(samples: np.ndarray, sentences: list[Segment], speakers: int 
     A voiceprint per sentence is about ten times cheaper than scanning the whole
     recording, and a sentence is the finest detail the dub can use anyway.
     """
-    import sherpa_onnx as so
+    try:
+        import sherpa_onnx as so
+    except ImportError:
+        print("  speaker detection is not installed, so everyone gets one voice; "
+              f"to add it, run the install command again: {REINSTALL}")
+        return
 
-    extractor = so.SpeakerEmbeddingExtractor(
-        so.SpeakerEmbeddingExtractorConfig(model=str(_embedding_model()), num_threads=THREADS))
-    voiceprints: list[np.ndarray | None] = []
-    for i, sentence in enumerate(sentences):
+    # Measured: a few sentences at once, two threads each, is about 30% faster
+    # than one sentence at a time on every thread, with the same voiceprints.
+    # With few cores that means one sentence at a time on all of them, as before.
+    together = max(1, THREADS // 2)
+    extractor = so.SpeakerEmbeddingExtractor(so.SpeakerEmbeddingExtractorConfig(
+        model=str(_embedding_model()), num_threads=max(1, THREADS // together)))
+
+    def voiceprint(sentence: Segment) -> np.ndarray | None:
         stream = extractor.create_stream()
         stream.accept_waveform(RATE, samples[int(sentence.start * RATE):int(sentence.end * RATE)])
         stream.input_finished()
-        voiceprints.append(np.array(extractor.compute(stream), dtype=np.float32)
-                           if extractor.is_ready(stream) else None)
-        _progress("comparing voices", (i + 1) / len(sentences))
+        if not extractor.is_ready(stream):
+            return None
+        return np.array(extractor.compute(stream), dtype=np.float32)
+
+    voiceprints: list[np.ndarray | None] = []
+    with ThreadPoolExecutor(together) as pool:
+        for found in pool.map(voiceprint, sentences):  # in order, so progress only grows
+            voiceprints.append(found)
+            _progress("comparing voices", len(voiceprints) / len(sentences))
     _progress_done()
     lengths = [s.end - s.start for s in sentences]
     for sentence, label in zip(sentences, group_voices(voiceprints, lengths, speakers, threshold)):
@@ -293,8 +346,12 @@ def speaker_genders(samples: np.ndarray, segments: list[Segment]) -> dict[int, s
             if total > 60:
                 break
         pitch = median_pitch(np.concatenate(clips))
-        genders[speaker] = "female" if pitch > MALE_FEMALE_F0 else "male"
-        print(f"  speaker {speaker + 1}: {pitch:.0f} Hz, {genders[speaker]}")
+        if pitch == 0.0:
+            genders[speaker] = "male"  # unvoiced: no pitch to judge, default to male
+            print(f"  speaker {speaker + 1}: unvoiced, defaulting to male")
+        else:
+            genders[speaker] = "female" if pitch > MALE_FEMALE_F0 else "male"
+            print(f"  speaker {speaker + 1}: {pitch:.0f} Hz, {genders[speaker]}")
     return genders
 
 

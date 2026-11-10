@@ -17,7 +17,7 @@ On Linux, paste this into a terminal. Nothing else needs installing first:
 curl -LsSf https://raw.githubusercontent.com/snysik1337/vtranslate/main/install.sh | sh
 ```
 
-Then open a new terminal. It takes about 650 MB of disk space (about 110 MB more
+Then open a new terminal. It takes about 610 MB of disk space (about 110 MB more
 if your Python is not version 3.11 to 3.14, because one is downloaded for it), and
 running the same command again updates it. The first dub downloads the speech models (about
 170 MB) and about 60 MB for each Russian voice it uses, only once.
@@ -93,10 +93,15 @@ it continues from the last finished step.
 | Voices | Piper (`--best` tries Microsoft's voices first) | local |
 | Mix | PyAV, which contains FFmpeg's libraries, so no ffmpeg program is needed | local |
 
-Lines separated by short pauses are spoken as one phrase at one steady speed,
-the slowest that keeps every line within half a second of the original. When
-Russian runs longer than the original, the whole phrase speeds up a little
-instead of single lines rushing.
+A line never starts before its speaker. It aims to start at most 0.2 seconds
+after and to finish at most 0.3 seconds after the speaker stops. Each line is
+spoken at the slowest speed that keeps to that, and the speed changes only
+gently from one line to the next, so nothing sounds rushed suddenly. The voices
+naturally talk faster than most people, so when there is room they speak 8%
+slower than that, and long pauses inside a line are shortened. When Russian
+runs longer than the original, only the lines around that spot speed up, not
+the whole video. If even the top speed (`--max-speed`) is not enough, those
+lines run late and the next pause brings the dub back in step.
 
 Each run prints how long every stage took.
 
@@ -104,6 +109,9 @@ Each run prints how long every stage took.
 
 - Speech recognition and translation still make mistakes, especially with names.
 - Russian verb gender can be wrong, because DeepL does not know who is speaking.
+- The offline voices restore ё in common words (пойдёт, учётной, ещё) and fix the
+  stress of a few words they get wrong (пе́ред, что́-то). Words whose stress
+  depends on meaning (воды, сети) are read as the voice guesses.
 - Speaker gender is guessed from voice pitch. Sentences that sound like the same
   person get one voice, and a few seconds of speech is too little to tell someone
   apart, so a person who only says a word or two gets the closest voice.

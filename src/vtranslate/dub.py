@@ -6,15 +6,16 @@ import hashlib
 import json
 import re
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from . import media
+from . import media, stress
 from .media import stretch
-from .speech import THREADS, Segment, cached_first
+from .speech import MODELS, REINSTALL, THREADS, Segment, download_file
 
 VOICES = {
     "edge": {"male": ["ru-RU-DmitryNeural"], "female": ["ru-RU-SvetlanaNeural"]},
@@ -27,11 +28,24 @@ EDGE_PROBES = 2
 CONCURRENCY = 4
 GAP = 0.05
 PHRASE_GAP = 1.0  # lines closer than this are spoken as one phrase
-SYNC_LAG = 0.5  # how late a line may start relative to the original
-SYNC_LEAD = 0.3  # how early a line may start, when that avoids speeding up
+# How late a line may start relative to the original. Measured on real dubs,
+# 0.2 s costs only about 0.04x of pace against 0.5 s. A line never starts early:
+# a voice that begins before the person on screen does is the easiest slip to see.
+SYNC_LAG = 0.2
+# How long after its speaker stops a line may still be spoken. Measured on real
+# dubs, 0.3 s costs 0.02x to 0.05x of pace and ends every case of the voice
+# talking on into a pause.
+SYNC_OVERRUN = 0.3
+LONGEST_STRETCH = 150  # lines of nonstop talk planned together
+# The voices talk faster than most people, so when the timing leaves room they
+# speak 8% slower than their natural pace; they speed up only when they must.
+CALM_SPEED = 0.92
+MAX_STEP = 0.15  # how much the speed may change from one line to the next in a phrase
+LONGEST_PAUSE = 0.25  # seconds; longer pauses inside a spoken line are shortened
 MAX_STRETCH = 1.15  # beyond this a line is spoken again instead of stretched
 MAX_SILENT_SHARE = 0.1  # lines a voice may fail to speak before it counts as broken
 ENVELOPE_RATE = 100
+VOICE_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
 # Stream copy into .mp4 only works for these; anything else stays in .mkv.
 MP4_CODECS = {"h264", "hevc", "av1", "vp9", "mpeg4"}
 
@@ -82,13 +96,22 @@ def assign_voices(segments: list[Segment], genders: dict[int, str], forced: str 
 def plan(segments: list[Segment], natural: list[float], total: float, max_speed: float) -> list[Placement]:
     """Choose a start and speed for every line, keeping the dub in sync.
 
-    Lines separated by short pauses form a phrase, spoken at one steady speed:
-    the slowest that keeps every line within SYNC_LAG of its original start and
-    ends the phrase before the next one begins. A little speed spread over a
-    whole phrase sounds calmer than single rushed lines. A phrase may also start
-    up to SYNC_LEAD early when that lowers the speed. When even max_speed can't
-    keep up, the dub runs late and the next pause pulls it back in sync.
+    Lines separated by short pauses form a phrase. A phrase is spoken at the
+    slowest steady speed that keeps every line within SYNC_LAG of its original
+    start and ends before the next phrase begins, but never slower than
+    CALM_SPEED. A little speed spread over several lines sounds calmer than
+    single rushed lines. No line starts before its speaker does.
+
+    Nonstop talk is one phrase many minutes long, and its tightest spot must
+    not set the speed for all of it. So only the lines that make a spot tight
+    get that speed; the lines before and after are planned again on their own,
+    the same way, and come out slower.
+
+    When even max_speed can't keep a phrase in sync, only the lines that cause
+    the delay and those catching up after it are rushed.
     """
+    # When each line must be finished: a little after its speaker stops.
+    ends = [segment.end + SYNC_OVERRUN for segment in segments]
     placements: list[Placement] = []
     cursor = 0.0
     first = 0
@@ -97,38 +120,175 @@ def plan(segments: list[Segment], natural: list[float], total: float, max_speed:
         while last < len(segments) and segments[last].start - segments[last - 1].end < PHRASE_GAP:
             last += 1
         limit = segments[last].start - GAP if last < len(segments) else total
-
-        def place(speed: float, lead: float) -> tuple[list[Placement], bool]:
-            out, at, in_sync = [], cursor, True
-            for k in range(first, last):
-                start = max(at, segments[k].start - lead)
-                in_sync &= start <= segments[k].start + SYNC_LAG
-                out.append(Placement(start, speed, natural[k] / speed))
-                at = start + out[-1].length + GAP
-            return out, in_sync and at - GAP <= limit + 1e-9
-
-        speed, lead = _slowest(place, max_speed, 0.0), 0.0
-        if speed > 1.0:
-            early = _slowest(place, max_speed, SYNC_LEAD)
-            if early < speed - 0.02:
-                speed, lead = early, SYNC_LEAD
-        phrase = place(speed, lead)[0]
+        # Hours of nonstop talk are planned a stretch at a time; planning them
+        # whole takes time that grows with the square of their length. A
+        # stretch may leave the next one its first line SYNC_LAG late.
+        phrase: list[Placement] = []
+        at, begin = cursor, first
+        while begin < last:
+            end = min(last, begin + LONGEST_STRETCH)
+            stop = limit if end == last else segments[end].start + SYNC_LAG - GAP
+            phrase += _stretch_of_talk(segments, natural, ends, begin, end, at, stop, max_speed)
+            at, begin = phrase[-1].start + phrase[-1].length + GAP, end
+        phrase = _smooth(segments, natural, first, phrase, cursor)
         placements += phrase
         cursor = phrase[-1].start + phrase[-1].length + GAP
         first = last
     return placements
 
 
-def _slowest(place, max_speed: float, lead: float) -> float:
-    """The lowest speed at which a phrase fits, or max_speed if none does."""
-    if place(1.0, lead)[1]:
-        return 1.0
-    if not place(max_speed, lead)[1]:
+def _stretch_of_talk(segments: list[Segment], natural: list[float], ends: list[float], first: int,
+                     last: int, cursor: float, limit: float, max_speed: float) -> list[Placement]:
+    """Plan lines first..last, which follow each other without a real pause."""
+    if _fits(segments, natural, ends, first, last, cursor, limit, max_speed):
+        return _steady(segments, natural, ends, first, last, cursor, limit, max_speed)
+    rushed = _place(segments, natural, first, last, cursor, max_speed)
+    out: list[Placement] = []
+    for begin, end, late in _pieces(segments, ends, rushed, first, limit):
+        if late:
+            out += rushed[begin - first:end - first]
+        else:
+            at = out[-1].start + out[-1].length + GAP if out else cursor
+            stop = segments[end].start - GAP if end < last else limit
+            out += _steady(segments, natural, ends, begin, end, at, stop, max_speed)
+    return out
+
+
+def _smooth(segments: list[Segment], natural: list[float], first: int, phrase: list[Placement],
+            cursor: float) -> list[Placement]:
+    """Soften speed changes inside a phrase to at most MAX_STEP from line to line.
+
+    Slower lines next to a faster one are sped up towards it, never the other
+    way round: a faster line only ends sooner, so nothing falls out of sync.
+    """
+    speeds = [placed.speed for placed in phrase]
+    for i in range(1, len(speeds)):
+        speeds[i] = max(speeds[i], speeds[i - 1] - MAX_STEP)
+    for i in range(len(speeds) - 2, -1, -1):
+        speeds[i] = max(speeds[i], speeds[i + 1] - MAX_STEP)
+    out, at = [], cursor
+    for k, (placed, speed) in enumerate(zip(phrase, speeds), start=first):
+        start = max(at, segments[k].start)
+        out.append(Placement(start, speed, natural[k] / speed))
+        at = start + out[-1].length + GAP
+    return out
+
+
+def _place(segments: list[Segment], natural: list[float], first: int, last: int, cursor: float,
+           speed: float) -> list[Placement]:
+    """Lines first..last one after another at one speed."""
+    out, at = [], cursor
+    for k in range(first, last):
+        start = max(at, segments[k].start)
+        out.append(Placement(start, speed, natural[k] / speed))
+        at = start + out[-1].length + GAP
+    return out
+
+
+def _fits(segments: list[Segment], natural: list[float], ends: list[float], first: int, last: int,
+          cursor: float, limit: float, speed: float) -> bool:
+    """Whether _place at this speed keeps every line in sync and ends by the limit."""
+    at = cursor
+    for k in range(first, last):
+        begin = segments[k].start
+        start = max(at, begin)
+        if start > begin + SYNC_LAG:
+            return False
+        at = start + natural[k] / speed + GAP
+        if at - GAP > ends[k] + 1e-9:
+            return False
+    return at - GAP <= limit + 1e-9
+
+
+def _steady(segments: list[Segment], natural: list[float], ends: list[float], first: int, last: int,
+            cursor: float, limit: float, max_speed: float) -> list[Placement]:
+    """Plan lines that fit at max_speed: steady speeds, each as slow as its spot allows."""
+    out: list[Placement | None] = [None] * (last - first)
+    todo = [(first, last, cursor, limit)]
+    while todo:
+        lo, hi, at, stop = todo.pop()
+
+        def fits(speed: float) -> bool:
+            return _fits(segments, natural, ends, lo, hi, at, stop, speed)
+
+        speed = _slowest(fits, max_speed)
+        placed = _place(segments, natural, lo, hi, at, speed)
+        begin, end = (lo, hi) if speed <= CALM_SPEED else _tight(segments, ends, placed, lo, stop)
+        out[begin - first:end - first] = placed[begin - lo:end - lo]
+        if begin > lo:  # the lines before must leave the tight ones their start
+            todo.append((lo, begin, at, placed[begin - lo].start - GAP))
+        if end < hi:  # the lines after carry on where the tight ones stop
+            before = placed[end - lo - 1]
+            todo.append((end, hi, before.start + before.length + GAP, stop))
+    return out
+
+
+def _tight(segments: list[Segment], ends: list[float], placed: list[Placement], first: int,
+           limit: float) -> tuple[int, int]:
+    """The lines (begin, end) that set a run's speed: slowing them would break sync.
+
+    The tightest spot is the line that starts closest to SYNC_LAG behind, the
+    line that ends closest to its own deadline, or the end of the run when
+    that is closer to its limit. The lines that push it there are the unbroken
+    chain before it, back to the last line that started at its own time.
+    """
+    def pushed(k: int) -> bool:  # started late because the line before ran on
+        return k > first and placed[k - first].start > segments[k].start + 1e-9
+
+    last = first + len(placed)
+    worst, end = placed[-1].start + placed[-1].length - limit, last
+    for k in range(first, last):
+        line = placed[k - first]
+        if pushed(k) and line.start - segments[k].start - SYNC_LAG > worst:
+            worst, end = line.start - segments[k].start - SYNC_LAG, k
+        if line.start + line.length - ends[k] > worst:
+            worst, end = line.start + line.length - ends[k], k + 1
+    begin = end - 1
+    while pushed(begin):
+        begin -= 1
+    return begin, end
+
+
+def _pieces(segments: list[Segment], ends: list[float], rushed: list[Placement], first: int,
+            limit: float) -> list[tuple[int, int, bool]]:
+    """Split a phrase that is late even at top speed into (begin, end, late) runs.
+
+    At top speed, a line that starts on its own time owes nothing to the lines
+    before it, so the phrase can be cut there. A run is late when one of its
+    lines starts more than SYNC_LAG behind or ends after its deadline, or when
+    it overruns the phrase:
+    nothing can help it, so it keeps top speed. The runs around it fit, and
+    neighbouring ones are joined so they are planned together.
+    """
+    runs: list[list] = []
+    for k, placed in enumerate(rushed, start=first):
+        late = (placed.start > segments[k].start + SYNC_LAG
+                or placed.start + placed.length > ends[k] + 1e-9)
+        if runs and placed.start > segments[k].start + 1e-9:  # pushed back by the line before
+            runs[-1][1], runs[-1][2] = k + 1, runs[-1][2] or late
+        else:
+            runs.append([k, k + 1, late])
+    if rushed[-1].start + rushed[-1].length > limit + 1e-9:
+        runs[-1][2] = True
+    pieces: list[list] = []
+    for begin, end, late in runs:
+        if pieces and not late and not pieces[-1][2]:
+            pieces[-1][1] = end
+        else:
+            pieces.append([begin, end, late])
+    return [tuple(piece) for piece in pieces]
+
+
+def _slowest(fits, max_speed: float) -> float:
+    """The lowest speed at which fits(speed) holds, or max_speed if none does."""
+    if fits(CALM_SPEED):
+        return CALM_SPEED
+    if not fits(max_speed):
         return max_speed
-    low, high = 1.0, max_speed
-    for _ in range(24):  # faster always fits at least as well, so bisect
+    low, high = CALM_SPEED, max_speed
+    for _ in range(14):  # faster always fits at least as well, so bisect; ends within 0.0001
         middle = (low + high) / 2
-        low, high = (low, middle) if place(middle, lead)[1] else (middle, high)
+        low, high = (low, middle) if fits(middle) else (middle, high)
     return high
 
 
@@ -145,9 +305,46 @@ def trim(audio: np.ndarray, rate: int, threshold: float = 0.005) -> np.ndarray:
     return audio[max(loud[0] - pad, 0):loud[-1] + pad]
 
 
+def shorten_pauses(audio: np.ndarray, rate: int) -> np.ndarray:
+    """Cut silences inside a line down to LONGEST_PAUSE, keeping their middle out.
+
+    Some voices pause up to 0.7 s between sentences; that time is better spent
+    speaking a little slower. "Silent" is relative to the line's loudest moment,
+    so a quietly spoken line never loses soft speech.
+    """
+    if not len(audio):
+        return audio
+    threshold = min(0.005, 0.01 * float(np.abs(audio).max()))
+    keep = int(LONGEST_PAUSE * rate)
+    quiet = np.abs(audio) <= threshold
+    edges = np.flatnonzero(np.diff(quiet.astype(np.int8), prepend=0, append=0))
+    cuts = [(start + keep // 2, end - (keep - keep // 2))
+            for start, end in zip(edges[::2], edges[1::2])
+            if end - start > keep and start > 0 and end < len(audio)]  # inner pauses only
+    if not cuts:
+        return audio
+    parts, at = [], 0
+    for begin, finish in cuts:
+        parts.append(audio[at:begin])
+        at = finish
+    parts.append(audio[at:])
+    return np.concatenate(parts)
+
+
 def shift_pitch(audio: np.ndarray, factor: float) -> np.ndarray:
     """Resample so the voice sounds higher (factor > 1) or lower; speed moves with it."""
     return np.interp(np.arange(0, len(audio), factor), np.arange(len(audio)), audio).astype(np.float32)
+
+
+def parallel(work, items, threads: int = THREADS) -> list:
+    """work(item) for every item, on several threads, results in order.
+
+    On Ctrl+C or an error, map() cancels everything still queued, so only the
+    few lines already running finish before it returns.
+    """
+    items = list(items)
+    with ThreadPoolExecutor(max(1, min(threads, len(items)))) as pool:
+        return list(pool.map(work, items))
 
 
 class Counter:
@@ -155,10 +352,13 @@ class Counter:
 
     def __init__(self, total: int) -> None:
         self.done, self.total = 0, total
+        self.lock = threading.Lock()
 
     def __call__(self, result=None):
-        self.done += 1
-        print(f"\r  speaking: {self.done}/{self.total}", end="", file=sys.stderr, flush=True)
+        with self.lock:  # lines finish on several threads at once
+            self.done += 1
+            done = self.done
+        print(f"\r  speaking: {done}/{self.total}", end="", file=sys.stderr, flush=True)
         return result
 
     def finish(self) -> None:
@@ -169,23 +369,40 @@ class Piper:
     """Offline Russian voices, generated straight into memory."""
 
     rate = 22050
-    speaking_rates = {"dmitri": 18.0, "irina": 13.0, "denis": 15.0, "ruslan": 15.0}  # chars/s
+    # Characters a second at normal speed with long pauses shortened, measured
+    # on the 72 lines of a real dub. Single lines differ from it by up to 10%.
+    speaking_rates = {"dmitri": 19.0, "irina": 15.0, "denis": 16.5, "ruslan": 17.0}
+    # Piper's length setting changes the speed far less than its number says:
+    # 1/1.4 gives about 1.22x. Measured on all four voices, which agree within
+    # 0.1x: the real speed for each setting. Asking by this table gives the
+    # planner true lengths, so little is left to stretch afterwards.
+    REAL_SPEED = [0.88, 0.955, 1.0, 1.045, 1.13, 1.26, 1.40, 1.50, 1.64]
+    LENGTH_SCALE = [1.25, 1.1, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4]
 
     def __init__(self) -> None:
         self.voices = {}
 
     def chars_per_second(self, voice: Voice) -> float:
-        return self.speaking_rates[voice.name]
+        # A pitch change is made by resampling, which changes the length with it.
+        return self.speaking_rates[voice.name] * (1 + voice.pitch / 200)
+
+    def length_scale(self, speed: float) -> float:
+        """The Piper setting that really speaks this much faster than normal."""
+        return float(np.interp(speed, self.REAL_SPEED, self.LENGTH_SCALE))
 
     def _load(self, name: str) -> None:
         import onnxruntime
-        from huggingface_hub import hf_hub_download
         from piper import PiperVoice
         from piper.config import PiperConfig
 
         base = f"ru/ru_RU/{name}/medium/ru_RU-{name}-medium.onnx"
-        model = cached_first(hf_hub_download, "rhasspy/piper-voices", base)
-        config = cached_first(hf_hub_download, "rhasspy/piper-voices", base + ".json")
+
+        model, config = MODELS / "piper" / base, MODELS / "piper" / (base + ".json")
+        if not (model.exists() and config.exists()):
+            print(f"  downloading {name} voice")
+            for path in (model, config):
+                if not path.exists():
+                    download_file(VOICE_URL + str(path.relative_to(MODELS / "piper")), path)
         options = onnxruntime.SessionOptions()
         # Short lines parallelise best one per core, not many threads per line.
         options.intra_op_num_threads = 1
@@ -195,26 +412,41 @@ class Piper:
         # Its memory pool keeps growing on long videos; going without costs about 5% speed.
         options.enable_cpu_mem_arena = False
         options.enable_mem_pattern = False
-        self.voices[name] = PiperVoice(
-            session=onnxruntime.InferenceSession(
-                model, sess_options=options, providers=["CPUExecutionProvider"]),
-            config=PiperConfig.from_dict(json.loads(Path(config).read_text(encoding="utf-8"))),
-        )
+        try:
+            self.voices[name] = PiperVoice(
+                session=onnxruntime.InferenceSession(
+                    str(model), sess_options=options, providers=["CPUExecutionProvider"]),
+                config=PiperConfig.from_dict(json.loads(config.read_text(encoding="utf-8"))),
+            )
+        except Exception as error:
+            # A damaged file would fail on every run, so it is fetched again next
+            # time. Other failures (memory, a library change) keep the download.
+            damaged = isinstance(error, (ValueError, UnicodeDecodeError)) or any(
+                sign in str(error) for sign in ("Protobuf", "INVALID_PROTOBUF"))
+            if damaged:
+                model.unlink(missing_ok=True)
+                config.unlink(missing_ok=True)
+                raise RuntimeError(f"the {name} voice file was damaged ({error}); "
+                                   "run again to download it afresh") from error
+            raise RuntimeError(f"the {name} voice could not be loaded ({error})") from error
 
     def prepare(self, voices) -> None:
         names = {voice.name for voice in voices} - set(self.voices)
-        if names:
-            with ThreadPoolExecutor(len(names)) as pool:
-                list(pool.map(self._load, names))
+        # Daemon threads, so Ctrl+C never waits for a voice download to finish.
+        from .fetch import Background
+
+        for loading in [Background(lambda name=name: self._load(name)) for name in names]:
+            loading.wait()
 
     def _speak(self, line: Line) -> np.ndarray:
         from piper import SynthesisConfig
 
         if not has_words(line.text):
             return np.zeros(0, dtype=np.float32)
-        config = SynthesisConfig(length_scale=1 / line.speed)
+        config = SynthesisConfig(length_scale=self.length_scale(line.speed))
         chunks = [c.audio_float_array
-                  for c in self.voices[line.voice.name].synthesize(line.text, syn_config=config)]
+                  for c in self.voices[line.voice.name].synthesize(stress.fix(line.text),
+                                                                   syn_config=config)]
         if not chunks:
             return np.zeros(0, dtype=np.float32)
         audio = np.concatenate(chunks)
@@ -225,8 +457,7 @@ class Piper:
     def speak_many(self, lines: list[Line]) -> list[np.ndarray]:
         self.prepare(line.voice for line in lines)
         count = Counter(len(lines))
-        with ThreadPoolExecutor(THREADS) as pool:
-            result = list(pool.map(lambda line: count(self._speak(line)), lines))
+        result = parallel(lambda line: count(self._speak(line)), lines)
         count.finish()
         return result
 
@@ -248,7 +479,11 @@ class Edge:
         return self.folder / f"{hashlib.sha1(key.encode()).hexdigest()}.mp3"
 
     async def _speak(self, line: Line, gate: asyncio.Semaphore) -> None:
-        import edge_tts
+        try:
+            import edge_tts
+        except ImportError as error:
+            raise VoiceServiceError("online voices are not installed; to add them, run the "
+                                    f"install command again: {REINSTALL}") from error
 
         dest = self._path(line)
         if dest.exists():
@@ -261,8 +496,10 @@ class Edge:
         tmp = dest.with_suffix(".part")
         async with gate:
             for attempt in range(EDGE_ATTEMPTS):
+                tmp.unlink(missing_ok=True)  # never trust a leftover partial file
                 try:
-                    await edge_tts.Communicate(line.text, line.voice.name, rate=rate,
+                    await edge_tts.Communicate(stress.fix(line.text, marks=False),
+                                               line.voice.name, rate=rate,
                                                pitch=pitch).save(str(tmp))
                     if tmp.stat().st_size:
                         tmp.rename(dest)
@@ -278,10 +515,18 @@ class Edge:
         count = Counter(len(lines))
 
         async def run(line: Line) -> None:
-            count(await self._speak(line, gate))
+            await self._speak(line, gate)
+            count(None)
 
-        await asyncio.gather(*(run(line) for line in lines))
-        count.finish()
+        tasks = [asyncio.create_task(run(line)) for line in lines]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            raise
+        finally:
+            count.finish()
 
     def _decode(self, line: Line) -> np.ndarray:
         path = self._path(line)
@@ -293,12 +538,14 @@ class Edge:
         # Identical lines share one file, so each is requested once. Requesting
         # them together would also make them overwrite each other's download.
         asyncio.run(self._speak_all(list(dict.fromkeys(lines))))
-        with ThreadPoolExecutor(THREADS) as pool:
-            return list(pool.map(self._decode, lines))
+        return parallel(self._decode, lines)
 
     def available(self, line: Line | None) -> bool:
         """Try one line first, so a failing service costs seconds and not a minute."""
-        import edge_tts
+        try:
+            import edge_tts
+        except ImportError:
+            return False
 
         async def probe() -> bool:
             for _ in range(EDGE_PROBES):
@@ -328,7 +575,7 @@ def synthesize(segments: list[Segment], voices: dict[int, Voice], total: float, 
     guessed = [len(s.text) / engine.chars_per_second(voices[s.speaker]) for s in segments]
     speeds = [round(p.speed, 2) for p in plan(segments, guessed, total, max_speed)]
     lines = [Line(s.text, voices[s.speaker], speed) for s, speed in zip(segments, speeds)]
-    clips = engine.speak_many(lines)
+    clips = [shorten_pauses(clip, engine.rate) for clip in engine.speak_many(lines)]
 
     natural = [len(clip) / engine.rate * speed for clip, speed in zip(clips, speeds)]
     placements = plan(segments, natural, total, max_speed)
@@ -342,17 +589,20 @@ def synthesize(segments: list[Segment], voices: dict[int, Voice], total: float, 
         fixed = [Line(segments[i].text, voices[segments[i].speaker], placements[i].speed)
                  for i in wrong]
         for i, clip in zip(wrong, engine.speak_many(fixed)):
-            clips[i], speeds[i] = clip, placements[i].speed
+            clips[i], speeds[i] = shorten_pauses(clip, engine.rate), placements[i].speed
 
     check_spoken(segments, clips)
 
     def fit(i: int) -> np.ndarray:
-        if len(clips[i]) and len(clips[i]) / engine.rate > placements[i].length * 1.02:
-            return stretch(clips[i], len(clips[i]) / engine.rate / placements[i].length, engine.rate)
-        return clips[i]
+        # Stretch a line to its planned length. Measured on the clip itself: a
+        # voice does not always speed up as much as it was asked to. Slowing
+        # down stops at MAX_STRETCH; a line that short is left to end early.
+        if not len(clips[i]):
+            return clips[i]
+        ratio = max(len(clips[i]) / engine.rate / placements[i].length, 1 / MAX_STRETCH)
+        return stretch(clips[i], ratio, engine.rate) if abs(ratio - 1) > 0.02 else clips[i]
 
-    with ThreadPoolExecutor(THREADS) as pool:
-        fitted = list(pool.map(fit, range(len(clips))))
+    fitted = parallel(fit, range(len(clips)))
 
     # Lines that run late can end after the video does; the track holds them all.
     ends = [p.start + len(clip) / engine.rate for clip, p in zip(fitted, placements)]
@@ -383,7 +633,8 @@ def check_spoken(segments: list[Segment], clips: list[np.ndarray]) -> None:
 def duck_envelope(segments: list[Segment], placements: list[Placement], total: float,
                   level: float) -> np.ndarray:
     """Gain curve for the original audio: lowered while anyone speaks."""
-    size = int((total + 1) * ENVELOPE_RATE)
+    last = max([total] + [p.start + p.length for p in placements if p.length > 0])
+    size = int((last + 1) * ENVELOPE_RATE)
     busy = np.zeros(size, dtype=bool)
     spans = [(s.start, s.end) for s in segments]
     spans += [(p.start, p.start + p.length) for p in placements if p.length > 0]
@@ -413,6 +664,9 @@ def match_loudness(track: np.ndarray, original: np.ndarray) -> np.ndarray:
     dub_level = level(track)
     if dub_level == 0:
         return track
+    original_level = level(original)
+    if original_level == 0:
+        return track
     # Peaks above 1.0 are fine here: the final mix goes through a limiter.
-    return track * np.clip(level(original) / dub_level, 0.5, 4.0)
+    return track * np.clip(original_level / dub_level, 0.5, 4.0)
 

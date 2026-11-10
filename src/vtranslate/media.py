@@ -50,7 +50,7 @@ def inspect(path: Path) -> Info:
         raise MediaError(f"cannot read this file ({error})") from error
 
 
-@functools.lru_cache(maxsize=32)
+@functools.lru_cache(maxsize=256)
 def _inspect(path: str, size: int, mtime: int) -> Info:
     with av.open(path) as container:
         audio = container.streams.audio

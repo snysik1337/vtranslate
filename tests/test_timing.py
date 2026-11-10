@@ -159,20 +159,23 @@ def test_plan_speeds_up_to_fit_and_never_overlaps():
     assert placed[2].start == 10  # the pause brings the dub back to the original timing
 
 
-def test_a_phrase_is_spoken_at_one_steady_speed():
+def test_speed_changes_gently_inside_a_phrase():
     # Old timing rushed the first line to 1.54x and left the second at 1.0x.
     segments = [Segment(0, 2, "a"), Segment(2, 4, "b"), Segment(10, 12, "c")]
-    placed = plan(segments, [3.0, 4.0, 1.0], 20, max_speed=1.6)
-    assert placed[0].speed == placed[1].speed
-    assert 1.2 < placed[0].speed < 1.25  # just enough to keep line b within the lag
-    assert placed[2].speed == 1.0
+    placed = plan(segments, [2.9, 2.0, 1.0], 20, max_speed=1.6)
+    # Just enough to keep line b within the lag.
+    assert placed[0].speed == pytest.approx(2.9 / (2 + dub.SYNC_LAG - dub.GAP), abs=0.01)
+    # Line b has room of its own, so it eases off, but only by one step.
+    assert placed[1].speed == pytest.approx(placed[0].speed - dub.MAX_STEP)
+    assert placed[2].speed == dub.CALM_SPEED  # room to spare: a calmer pace
 
 
-def test_lines_start_early_only_when_that_helps():
+def test_lines_never_start_before_the_speaker():
     calm = plan([Segment(5, 7, "a")], [1.0], 20, max_speed=1.6)
-    assert calm[0].start == 5  # no reason to move it
+    assert calm[0].start == 5
+    # Even when an early start would save speed.
     tight = plan([Segment(5, 7, "a"), Segment(7, 9, "b")], [2.5, 2.0], 20, max_speed=1.6)
-    assert tight[0].start == pytest.approx(5 - dub.SYNC_LEAD)
+    assert tight[0].start == 5 and tight[0].speed > 1.0
 
 
 class FakeEngine:
@@ -198,7 +201,7 @@ def test_good_speed_guess_needs_only_one_pass(monkeypatch):
     engine = FakeEngine(guess=10)
     track, placed = dub.synthesize(segments, {0: Voice("v")}, 10, 1.6, engine)
     assert len(engine.calls) == 1
-    assert placed[0].speed == pytest.approx(1.22, abs=0.02)
+    assert placed[0].speed == pytest.approx(3.0 / (2 + dub.SYNC_LAG - dub.GAP), abs=0.02)
 
 
 def test_bad_speed_guess_speaks_the_line_again(monkeypatch):
@@ -207,7 +210,7 @@ def test_bad_speed_guess_speaks_the_line_again(monkeypatch):
     engine = FakeEngine(guess=30)  # thinks the voice is 3x faster than it is
     dub.synthesize(segments, {0: Voice("v")}, 10, 1.6, engine)
     assert len(engine.calls) == 2
-    assert engine.calls[1][0].speed == pytest.approx(1.22, abs=0.02)
+    assert engine.calls[1][0].speed == pytest.approx(3.0 / (2 + dub.SYNC_LAG - dub.GAP), abs=0.02)
 
 
 def test_lines_running_past_the_end_are_kept_not_crashing(monkeypatch):
@@ -643,3 +646,507 @@ def test_each_file_is_opened_once_for_inspection(tmp_path, monkeypatch):
     monkeypatch.setattr(av, "open", lambda *a, **k: opened.append(a) or real(*a, **k))
     assert fetch.has_audio(video) and fetch.has_video(video) and fetch.video_codec(video) == "h264"
     assert len(opened) == 1
+
+
+@pytest.mark.parametrize("problem, expected", [
+    (EOFError, ""),  # Ctrl+D: cancel the prompt
+    (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), "text editor"),
+    (OSError("no terminal"), "text editor"),
+])
+def test_a_failed_key_prompt_is_explained_not_a_crash(monkeypatch, capsys, problem, expected):
+    import getpass
+
+    from vtranslate import cli
+
+    def failing(prompt=""):
+        raise problem
+
+    monkeypatch.setattr(getpass, "getpass", failing)
+    assert cli.ask_for_key() is False
+    out = capsys.readouterr().out
+    assert expected in out and "DEEPL_AUTH_KEY=" not in out  # never on the command line
+
+
+def test_ctrl_c_at_the_key_prompt_stops_vtranslate(monkeypatch, fake_deepl):
+    import getpass
+
+    from vtranslate import cli
+
+    def interrupted(prompt=""):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(getpass, "getpass", interrupted)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    started = []
+    monkeypatch.setattr(cli, "run", lambda source, args: started.append(source))
+    monkeypatch.setattr(sys, "argv", ["vtranslate", "--set-deepl-key", "https://example.com/v"])
+    with pytest.raises(SystemExit) as exit_:
+        cli.main()
+    assert exit_.value.code == 130 and not started  # no dub after Ctrl+C
+
+
+def test_ctrl_c_during_a_batch_exits_with_130(monkeypatch, capsys):
+    from vtranslate import cli
+
+    done = []
+
+    def fake_run(source, args):
+        if source == "b":
+            raise KeyboardInterrupt
+        done.append(source)
+        return Path(source)
+
+    monkeypatch.setattr(cli, "run", fake_run)
+    monkeypatch.setattr(cli, "prepare_translation", lambda args: None)
+    monkeypatch.setattr(sys, "argv", ["vtranslate", "a", "b", "c"])
+    with pytest.raises(SystemExit) as exit_:
+        cli.main()
+    assert exit_.value.code == 130 and done == ["a"]
+    assert "run the same command again" in capsys.readouterr().err
+
+
+def test_rerunning_skips_finished_videos_unless_settings_change(tmp_path, monkeypatch, capsys):
+    from vtranslate import cli
+
+    monkeypatch.setattr(cli, "CACHE", tmp_path / "jobs")
+    source = tmp_path / "talk.mp4"
+    source.write_bytes(b"video")
+    dubbed = []
+
+    def fake_dub(source, args, work):
+        dubbed.append(args.speakers)
+        output = args.output / "talk [ru].mp4"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"dub")
+        return output
+
+    monkeypatch.setattr(cli, "_dub", fake_dub)
+    args = lambda *extra: cli.parse_args(["-o", str(tmp_path / "out"), *extra, str(source)])
+    first = cli.run(str(source), args())
+    with pytest.raises(cli.AlreadyDubbed):
+        cli.run(str(source), args())  # same settings: skipped, not paid for again
+    cli.run(str(source), args("--speakers", "3"))  # new settings: dubbed again
+    first.unlink()
+    cli.run(str(source), args("--speakers", "3"))  # deleted: dubbed again
+    assert dubbed == [None, 3, 3]
+    monkeypatch.setattr(sys, "argv", ["vtranslate", "-o", str(tmp_path / "out"),
+                                      "--speakers", "3", str(source)])
+    monkeypatch.setattr(cli, "prepare_translation", lambda args: None)
+    with pytest.raises(SystemExit):
+        cli.main()
+    out = capsys.readouterr().out
+    assert "Already dubbed" in out and "Done in" not in out
+
+
+def test_thread_pool_drops_queued_work_on_ctrl_c():
+    import time
+
+    started = []
+
+    def slow(item):
+        started.append(item)
+        if item == 0:
+            raise KeyboardInterrupt
+        time.sleep(0.05)
+
+    with pytest.raises(KeyboardInterrupt):
+        dub.parallel(slow, range(400), threads=2)
+    assert len(started) < 20
+
+
+def test_progress_counter_counts_every_line_across_threads(capsys):
+    count = dub.Counter(2000)
+    dub.parallel(count, range(2000), threads=8)
+    assert count.done == 2000
+
+
+def test_cancelling_a_new_key_keeps_the_existing_one(monkeypatch, capsys, fake_deepl):
+    import getpass
+
+    from vtranslate import cli
+
+    monkeypatch.setattr(getpass, "getpass", lambda prompt="": "")  # Enter: cancel
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    cli.prepare_translation(cli.parse_args(["--set-deepl-key", "https://example.com/v"]))
+    assert "Keeping the key you already have" in capsys.readouterr().out
+
+
+def test_find_gaps_is_fast_and_ignores_words_before_a_span():
+    import time
+
+    words = [Word(i * 0.4, i * 0.4 + 0.3, " w") for i in range(30000)]
+    spans = [(i * 4.0, i * 4.0 + 3.5) for i in range(3000)]
+    began = time.time()
+    assert speech.find_gaps(spans, words) == []
+    assert time.time() - began < 0.5
+    # A word that ends before a span starts must not hide a gap inside it.
+    assert speech.find_gaps([(10.0, 14.0)], [Word(1.0, 2.0, " a"), Word(13.5, 13.9, " b")]) \
+        == [(10.0, 13.5)]
+
+
+def test_cut_off_downloads_are_never_kept(tmp_path, monkeypatch):
+    import io
+    import urllib.request
+
+    class Short(io.BytesIO):
+        headers = {"Content-Length": "100"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout: Short(b"x" * 40))
+    dest = tmp_path / "voice.onnx"
+    with pytest.raises(OSError, match="cut short"):
+        speech.download_file("https://example.com/voice.onnx", dest)
+    assert not dest.exists() and not list(tmp_path.iterdir())
+
+
+def test_voices_talk_calmer_when_there_is_room_and_speed_up_only_when_needed():
+    roomy = plan([Segment(0, 3, "a")], [2.0], 20, max_speed=1.6)
+    assert roomy[0].speed == dub.CALM_SPEED  # 8% slower than natural
+    # Line a has 2.9 s to say in 2 s, and may run on only SYNC_OVERRUN after its speaker.
+    snug = plan([Segment(0, 2, "a"), Segment(2.5, 4, "b")], [2.9, 1.0], 20, max_speed=1.6)
+    assert snug[0].speed == pytest.approx(2.9 / (2 + dub.SYNC_OVERRUN), abs=0.01)
+
+
+def test_long_pauses_inside_a_line_are_shortened():
+    rate = 1000
+    word = np.ones(300, dtype=np.float32) * 0.5
+    line = np.concatenate([np.zeros(50), word, np.zeros(700), word, np.zeros(100), word, np.zeros(50)])
+    out = dub.shorten_pauses(line.astype(np.float32), rate)
+    assert len(out) == len(line) - (700 - 250)  # only the long inner pause is cut
+    assert out[:50].sum() == 0 and out[-50:].sum() == 0  # edges are left to trim()
+
+
+def test_pronunciation_fixes_add_yo_and_stress_but_keep_ambiguous_words():
+    from vtranslate.stress import ACCENT, fix
+
+    assert fix("Еще раз: учетной записи нет, он пойдет.") == "Ещё раз: учётной записи нет, он пойдёт."
+    assert fix("Перед этим что-то сломалось.") == f"Пе{ACCENT}ред этим что{ACCENT}то сломалось."
+    assert fix("ПЕРЕД") == f"ПЕ{ACCENT}РЕД"
+    unchanged = "Все воды и сети, передать, перешел, Linux 2.0"  # meaning-dependent or unlisted
+    assert fix(unchanged) == unchanged
+
+
+def test_every_pronunciation_fix_is_a_real_change():
+    from vtranslate.stress import FIXES
+
+    for plain, fixed in FIXES.items():
+        assert plain != fixed and "+" not in fixed and "ё" not in plain
+
+
+def test_calm_pace_never_starts_lines_before_the_speaker():
+    # Dense talk where 0.98x fits but 0.92x does not: no early start just to be calmer.
+    segments = [Segment(i * 2.0, i * 2.0 + 1.9, "a") for i in range(10)]
+    placed = plan(segments, [1.9] * 10, 30, max_speed=1.6)
+    assert all(p.start >= s.start - 1e-9 for s, p in zip(segments, placed))
+
+
+def test_a_voice_that_fails_for_other_reasons_is_not_deleted(tmp_path, monkeypatch):
+    import onnxruntime
+
+    monkeypatch.setattr(dub, "MODELS", tmp_path)
+    model = tmp_path / "piper" / "ru/ru_RU/dmitri/medium/ru_RU-dmitri-medium.onnx"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"model")
+    model.with_name(model.name + ".json").write_text("{}")
+
+    def out_of_memory(*args, **kwargs):
+        raise RuntimeError("Failed to allocate memory")
+
+    monkeypatch.setattr(onnxruntime, "InferenceSession", out_of_memory)
+    with pytest.raises(RuntimeError, match="could not be loaded"):
+        dub.Piper()._load("dmitri")
+    assert model.exists()  # kept: downloading it again would not help
+
+    def damaged(*args, **kwargs):
+        raise RuntimeError("[ONNXRuntimeError] : 7 : INVALID_PROTOBUF : Load model failed")
+
+    monkeypatch.setattr(onnxruntime, "InferenceSession", damaged)
+    with pytest.raises(RuntimeError, match="damaged"):
+        dub.Piper()._load("dmitri")
+    assert not model.exists()  # fetched afresh next time
+
+
+def test_beret_and_other_meanings_are_left_alone_and_edge_gets_only_yo():
+    from vtranslate.stress import ACCENT, fix
+
+    assert fix("красный берет") == "красный берет"
+    assert fix("Перед этим он пойдет", marks=False) == "Перед этим он пойдёт"
+    assert ACCENT not in fix("Перед что-то", marks=False)
+
+
+def test_a_finished_batch_reruns_without_deepl(tmp_path, monkeypatch, capsys):
+    from vtranslate import cli
+
+    monkeypatch.setattr(cli, "CACHE", tmp_path / "jobs")
+    source = tmp_path / "talk.mp4"
+    source.write_bytes(b"video")
+    out = tmp_path / "out"
+
+    def fake_dub(source, args, work):
+        path = args.output / "talk [ru].mp4"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"dub")
+        return path
+
+    monkeypatch.setattr(cli, "_dub", fake_dub)
+    cli.run(str(source), cli.parse_args(["-o", str(out), str(source)]))
+
+    def offline(args):
+        raise SystemExit("error: could not reach DeepL")
+
+    monkeypatch.setattr(cli, "prepare_translation", offline)
+    monkeypatch.setattr(sys, "argv", ["vtranslate", "-o", str(out), str(source)])
+    with pytest.raises(SystemExit) as exit_:
+        cli.main()
+    assert exit_.value.code == 0 and "Already dubbed" in capsys.readouterr().out
+
+
+def test_two_downloads_of_one_file_never_share_a_temp_file(tmp_path, monkeypatch):
+    import io
+    import threading
+    import urllib.request
+
+    seen = []
+
+    class Slow(io.BytesIO):
+        headers = {"Content-Length": "4"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, *args):
+            seen.extend(p.name for p in tmp_path.glob("*.part"))
+            return super().read(*args)
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout: Slow(b"data"))
+    dest = tmp_path / "voice.onnx"
+    threads = [threading.Thread(target=speech.download_file, args=("u", dest)) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert dest.read_bytes() == b"data" and not list(tmp_path.glob("*.part"))
+    assert all(name.startswith("voice.onnx.") for name in seen)
+
+
+def test_soft_speech_is_not_mistaken_for_a_pause():
+    rate = 1000
+    soft = np.full(600, 0.004, dtype=np.float32)  # a quiet line: below 0.005 throughout
+    line = np.concatenate([np.full(100, 0.3), soft, np.full(100, 0.3)]).astype(np.float32) * 0.01
+    assert len(dub.shorten_pauses(line, rate)) == len(line)
+
+
+def _fake_youtube(monkeypatch, tmp_path, picture_waits=False):
+    """A stand-in for yt-dlp: audio and picture as separate files, counting lookups."""
+    import time
+
+    import yt_dlp
+
+    audio_file, video_file = tmp_path / "a.m4a", tmp_path / "v.mp4"
+    make_media(audio_file, video=False)
+    make_media(video_file)
+    lookups = []
+
+    class FakeYDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, download=False, process=True):
+            lookups.append(url)
+            return {"id": "x", "title": "Talk", "formats": [{"vcodec": "h264"}, {"vcodec": "none"}]}
+
+        def process_ie_result(self, info, download=True):
+            video = self.options["format"] == "bv*"
+            while video and picture_waits:
+                for hook in self.options["progress_hooks"]:
+                    hook({"status": "downloading"})
+                time.sleep(0.01)
+            target = Path(self.options["outtmpl"].replace("%(ext)s", "mp4" if video else "m4a"))
+            target.write_bytes((video_file if video else audio_file).read_bytes())
+            return {**info, "requested_downloads": [{"filepath": str(target)}]}
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
+    return lookups
+
+
+def test_the_picture_download_reuses_the_first_lookup(tmp_path, monkeypatch):
+    from vtranslate import fetch
+
+    lookups = _fake_youtube(monkeypatch, tmp_path)
+    work = tmp_path / "job"
+    work.mkdir()
+    got = fetch.download("https://www.youtube.com/watch?v=x", work, 720, None)
+    assert fetch.has_video(got.video_path())
+    assert len(lookups) == 1  # YouTube looked up once, not once per download
+
+
+def test_a_failed_dub_stops_the_picture_download(tmp_path, monkeypatch):
+    from vtranslate import fetch
+
+    _fake_youtube(monkeypatch, tmp_path, picture_waits=True)
+    work = tmp_path / "job"
+    work.mkdir()
+    got = fetch.download("https://www.youtube.com/watch?v=x", work, 720, None)
+    got.cancel()
+    got.pending.thread.join(timeout=2)
+    assert got.pending.done and "the dub stopped" in str(got.pending.error)  # stopped, not finished
+
+
+def test_one_overlong_line_does_not_rush_the_whole_phrase():
+    # Twenty back-to-back lines; only the first needs far more time than it has.
+    segs = [Segment(i * 3.1, i * 3.1 + 3, "x") for i in range(20)]
+    placed = dub.plan(segs, [8.0] + [2.5] * 19, 70, 1.6)
+    speeds = [round(p.speed, 2) for p in placed]
+    assert speeds[0] == 1.6
+    assert speeds.count(1.6) <= 4  # the long line and the few catching up after it
+    assert speeds[-1] == dub.CALM_SPEED
+    assert all(abs(a - b) <= dub.MAX_STEP + 0.011 for a, b in zip(speeds, speeds[1:]))
+    for before, after in zip(placed, placed[1:]):
+        assert after.start >= before.start + before.length  # never two lines at once
+    assert all(p.start <= s.start + dub.SYNC_LAG + 1e-9 for p, s in zip(placed[4:], segs[4:]))
+
+
+def test_a_late_phrase_only_rushes_the_lines_that_catch_up():
+    segs = [Segment(0, 3, "x")] + [Segment(4.2 + i * 3.1, 7.2 + i * 3.1, "x") for i in range(10)]
+    placed = dub.plan(segs, [9.0] + [2.5] * 10, 40, 1.6)
+    speeds = [round(p.speed, 2) for p in placed]
+    assert speeds[:2] == [1.6, 1.6]
+    assert speeds[-1] == dub.CALM_SPEED and speeds.count(1.6) <= 4
+    assert speeds == sorted(speeds, reverse=True)  # it eases off step by step
+
+
+def test_split_phrases_are_never_later_than_rushing_everything():
+    import random
+
+    rng = random.Random(7)
+    for _ in range(200):
+        at, segs, natural = 0.0, [], []
+        for _ in range(rng.randint(1, 40)):
+            at += rng.choice([0.1, 0.3, 0.8, 1.5, 4.0])
+            length = rng.uniform(0.8, 6)
+            segs.append(Segment(at, at + length, "x"))
+            natural.append(length * rng.choice([0.6, 0.9, 1.1, 1.5, 2.5]))
+            at += length
+        placed = dub.plan(segs, natural, at, 1.6)
+        cursor, worst = 0.0, 0.0
+        for seg, length in zip(segs, natural):  # everything at top speed
+            start = max(cursor, seg.start)
+            worst = max(worst, start - seg.start)
+            cursor = start + length / 1.6 + dub.GAP
+        assert max(p.start - s.start for p, s in zip(placed, segs)) <= max(worst, dub.SYNC_LAG) + 1e-6
+        assert all(dub.CALM_SPEED - 1e-9 <= p.speed <= 1.6 + 1e-9 for p in placed)
+        for before, after in zip(placed, placed[1:]):
+            assert after.start >= before.start + before.length - 1e-9
+
+
+def test_a_line_spoken_too_fast_is_slowed_to_the_plan(monkeypatch):
+    class Quick:
+        rate = 16000
+
+        def chars_per_second(self, voice):
+            return 20 / 2.6  # the guess: 20 characters take 2.6 s
+
+        def speak_many(self, lines):
+            # The voice turns out quicker than guessed: 2.3 s for 20 characters.
+            return [np.full(int(2.3 * len(line.text) / 20 / line.speed * self.rate), 0.1,
+                            dtype=np.float32) for line in lines]
+
+    stretched = []
+    monkeypatch.setattr(dub, "stretch", lambda audio, tempo, rate: stretched.append(tempo) or audio)
+    # The next line follows at once, so the first was guessed to need speeding up.
+    segs = [Segment(0.0, 1.9, "х" * 20), Segment(2.0, 3.0, "х" * 4)]
+    dub.synthesize(segs, {0: dub.Voice("dmitri")}, 10, 1.6, Quick())
+    assert stretched and 1 / dub.MAX_STRETCH <= stretched[0] < 0.98  # slowed, not left fast
+
+
+def test_a_tight_spot_does_not_set_the_speed_of_nonstop_talk():
+    # Sixty lines with no real pause; only lines 30-32 have too much to say.
+    segs = [Segment(i * 3.2, i * 3.2 + 3, "x") for i in range(60)]
+    natural = [2.6] * 60
+    natural[30:33] = [4.4, 4.4, 4.4]
+    placed = dub.plan(segs, natural, 200, 1.6)
+    speeds = [p.speed for p in placed]
+    assert max(speeds[30:33]) > 1.2
+    assert speeds[0] == dub.CALM_SPEED and speeds[-1] == dub.CALM_SPEED
+    assert sum(s > 1.0 for s in speeds) < 15  # the tight lines and those easing in and out
+    assert all(abs(a - b) <= dub.MAX_STEP + 1e-9 for a, b in zip(speeds, speeds[1:]))
+    assert all(-1e-9 <= p.start - s.start <= dub.SYNC_LAG + 1e-9 for p, s in zip(placed, segs))
+
+
+def test_a_respoken_line_that_is_still_too_long_is_stretched_to_fit(monkeypatch):
+    class Stubborn:
+        rate = 16000
+
+        def chars_per_second(self, voice):
+            return 20.0  # a guess twice too fast, so the line is spoken again
+
+        def speak_many(self, lines):
+            # Asked for more speed, this voice delivers only half of it.
+            return [np.full(int(len(line.text) / 10 / (1 + (line.speed - 1) / 2) * self.rate),
+                            0.1, dtype=np.float32) for line in lines]
+
+    stretched = []
+    monkeypatch.setattr(dub, "stretch",
+                        lambda audio, tempo, rate: stretched.append(tempo) or audio[:int(len(audio) / tempo)])
+    # 4 s of speech for a 2 s slot, with the next line straight after.
+    segs = [Segment(0.0, 2.0, "х" * 40), Segment(2.1, 4.0, "х" * 10)]
+    track, placed = dub.synthesize(segs, {0: dub.Voice("dmitri")}, 10, 1.6, Stubborn())
+    assert stretched and max(stretched) > 1.02  # not left overlapping the next line
+
+
+def test_piper_is_asked_for_the_speed_it_really_delivers():
+    piper = dub.Piper()
+    assert piper.length_scale(1.0) == 1.0
+    # Measured: a setting of 0.7 speaks 1.26x faster, not the 1.43x its number says.
+    assert piper.length_scale(1.26) == pytest.approx(0.7)
+    assert piper.length_scale(dub.CALM_SPEED) > 1 / dub.CALM_SPEED
+    scales = [piper.length_scale(s / 100) for s in range(85, 200, 5)]
+    assert scales == sorted(scales, reverse=True) and min(scales) >= 0.4
+
+
+def test_a_line_does_not_talk_on_into_the_pause_after_it():
+    # 3.2 s to say in a 3 s slot, then a 4 s pause: without a limit the calm
+    # pace would stretch it to 3.5 s, half a second after the speaker stopped.
+    segs = [Segment(0, 3, "a"), Segment(7, 9, "b")]
+    placed = dub.plan(segs, [3.2, 1.0], 20, 1.6)
+    assert placed[0].start + placed[0].length <= 3 + dub.SYNC_OVERRUN + 1e-6
+    assert placed[0].speed < 1.0  # it still takes the time it is allowed
+    assert placed[1].speed == dub.CALM_SPEED
+
+
+def test_a_line_that_cannot_finish_in_time_is_spoken_at_top_speed():
+    placed = dub.plan([Segment(0, 2, "a"), Segment(9, 11, "b")], [6.0, 1.0], 20, 1.6)
+    assert placed[0].speed == 1.6 and placed[1].start == 9
+
+
+def test_hours_of_nonstop_talk_are_planned_quickly():
+    import time
+
+    segs = [Segment(i * 3.0, i * 3.0 + 2.95, "x") for i in range(2000)]
+    began = time.perf_counter()
+    placed = dub.plan(segs, [3.6] * 2000, 6000, 1.6)
+    assert time.perf_counter() - began < 3  # was 5 s before long talk was planned in stretches
+    assert all(-1e-9 <= p.start - s.start <= dub.SYNC_LAG + 1e-6 for p, s in zip(placed, segs))
+    speeds = [p.speed for p in placed]
+    assert all(abs(a - b) <= dub.MAX_STEP + 1e-9 for a, b in zip(speeds, speeds[1:]))
+
+
+def test_a_pitch_shifted_voice_is_guessed_at_its_real_length():
+    piper = dub.Piper()
+    # Lowering the pitch by resampling makes a line longer, so fewer characters a second.
+    assert piper.chars_per_second(dub.Voice("denis", -36)) == pytest.approx(16.5 * 0.82)
+    assert piper.chars_per_second(dub.Voice("denis")) == 16.5

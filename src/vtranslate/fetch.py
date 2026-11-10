@@ -5,6 +5,7 @@ the picture keeps downloading in the background, so work can start straight away
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import re
 import shutil
@@ -60,6 +61,11 @@ class Source:
     title: str
     video: Path | None = None
     pending: Background | None = None  # downloads the picture and returns its path
+    stop: threading.Event | None = None  # set to stop that download
+
+    def cancel(self) -> None:
+        if self.stop:
+            self.stop.set()
 
     def check(self) -> None:
         if self.pending:
@@ -133,11 +139,26 @@ def download(url: str, work: Path, quality: int, cookies_from: str | None) -> So
     if cookies_from:
         base["cookiesfrombrowser"] = (cookies_from,)
 
+    stop = threading.Event()
+
+    def stopped(progress: dict) -> None:
+        if stop.is_set():
+            raise yt_dlp.utils.DownloadCancelled("the dub stopped")
+
+    found: dict = {}
+
     def fetch(stem: str, formats: str) -> tuple[dict, Path]:
-        options = {**base, "format": formats, "outtmpl": str(work / f"{stem}.%(ext)s")}
+        options = {**base, "format": formats, "outtmpl": str(work / f"{stem}.%(ext)s"),
+                   "progress_hooks": [stopped]}
         try:
             with Downloader(options) as ydl:
-                info = ydl.extract_info(url, download=True)
+                if found:  # reuse the first lookup: YouTube's takes about 5 seconds
+                    info = ydl.process_ie_result(copy.deepcopy(found), download=True)
+                else:
+                    raw = ydl.extract_info(url, download=False, process=False)
+                    if raw.get("_type", "video") == "video":
+                        found.update(copy.deepcopy(raw))
+                    info = ydl.process_ie_result(raw, download=True)
         except yt_dlp.utils.YoutubeDLError as error:
             # Often temporary (network, rate limits), so the job folder is kept.
             message = re.sub(r"^ERROR:\s*", "", str(error))
@@ -167,7 +188,7 @@ def download(url: str, work: Path, quality: int, cookies_from: str | None) -> So
             raise SourceError("this address has sound but no video")
         return path
 
-    return Source(audio, title, pending=Background(picture))
+    return Source(audio, title, pending=Background(picture), stop=stop)
 
 
 def local(path: str) -> Source:
